@@ -1,0 +1,539 @@
+<title>Study Timer</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* Layout: one centered column. Big countdown on top, then "set up" and "join" side by side (stacked on phones). */
+  :root {
+    --bg: #f2f5f2;
+    --surface: #ffffff;
+    --fg: #1b2420;
+    --muted: #5d6a63;
+    --line: #d3dbd6;
+    --focus: #c2412d;   /* tomato: focus phase */
+    --break: #2c7a5f;   /* sage: break phase */
+    --font-display: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+    --font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-digits: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111614; --surface: #19201d; --fg: #e5ebe7; --muted: #94a29a;
+      --line: #2b3530; --focus: #f07a61; --break: #5cc29a; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111614; --surface: #19201d; --fg: #e5ebe7; --muted: #94a29a;
+    --line: #2b3530; --focus: #f07a61; --break: #5cc29a; color-scheme: dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 28px 40px;
+  }
+  .app { max-width: 720px; margin: 0 auto; display: grid; gap: 20px; }
+
+  h1 { font-family: var(--font-display); font-size: 1.6rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-family: var(--font-display); font-size: 1.05rem; font-weight: 650; margin: 0; text-wrap: balance; }
+  .label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; }
+
+  /* Timer display: the one emphasized object on the page */
+  .timer {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 28px 20px 24px;
+    display: grid; justify-items: center; gap: 6px;
+    text-align: center;
+  }
+  .phase-pill {
+    font-size: 0.8rem; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 3px 12px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .clock {
+    font-family: var(--font-digits);
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(3.5rem, 16vw, 6.5rem);
+    font-weight: 600; line-height: 1; letter-spacing: -0.03em;
+  }
+  .round { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .settings { color: var(--muted); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  .settings:empty { display: none; }
+  .digits { font-family: var(--font-digits); font-variant-numeric: tabular-nums; }
+
+  /* Phase colors: the pill and the digits take the phase's color */
+  .timer[data-state="focus"] .phase-pill { color: var(--focus); border-color: var(--focus); }
+  .timer[data-state="focus"] .clock { color: var(--focus); }
+  .timer[data-state="break"] .phase-pill { color: var(--break); border-color: var(--break); }
+  .timer[data-state="break"] .clock { color: var(--break); }
+  .timer[data-state="finished"] .phase-pill { color: var(--bg); background: var(--fg); border-color: var(--fg); }
+  .timer[data-state="none"] .clock { color: var(--muted); }
+
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }
+  .panel { display: grid; gap: 14px; align-content: start; min-width: 0; }
+  .fields { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .field { display: grid; gap: 4px; min-width: 0; }
+  .field label { font-size: 0.82rem; color: var(--muted); }
+
+  input {
+    font: inherit; color: var(--fg); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; width: 100%; box-sizing: border-box; min-width: 0;
+  }
+  input.code { font-family: var(--font-digits); letter-spacing: 0.04em; }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    border-radius: 8px; padding: 8px 14px;
+    border: 1px solid var(--fg); background: var(--fg); color: var(--bg);
+  }
+  button.secondary { background: transparent; color: var(--fg); border-color: var(--line); }
+
+  .hint { font-size: 0.82rem; color: var(--muted); margin: 0; }
+  .error { font-size: 0.85rem; color: var(--focus); margin: 0; min-height: 1.3em; }
+  .note { font-size: 0.82rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: 14px; margin: 0; }
+  .selfcheck { font-family: var(--font-digits); font-size: 0.75rem; color: var(--muted); margin: 0; min-width: 0; }
+  .selfcheck summary { cursor: pointer; }
+  .selfcheck ul { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 2px; overflow-wrap: anywhere; }
+  .selfcheck .fail { color: var(--focus); }
+
+  @media (max-width: 420px) { .fields { grid-template-columns: 1fr 1fr; } }
+</style>
+
+<div class="app">
+  <header>
+    <h1>Study Timer</h1>
+    <p class="hint">Set a session, send the code to your study partner, and keep each other honest.</p>
+  </header>
+
+  <!-- Timer display -->
+  <section class="timer" id="timer" data-state="none">
+    <span class="phase-pill" id="phase">Not started</span>
+    <div class="clock" id="clock" role="timer">--:--</div>
+    <div class="round" id="round">Start a session or join a partner's</div>
+    <div class="settings" id="settings"></div>
+  </section>
+
+  <div class="panels">
+    <!-- Creator form + share code -->
+    <section class="panel">
+      <h2>Set up a session</h2>
+      <form id="creator" class="panel" onsubmit="return false">
+        <div class="fields">
+          <div class="field">
+            <label for="focus">Focus minutes</label>
+            <input id="focus" type="number" min="1" max="180" value="25" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label for="break">Break minutes</label>
+            <input id="break" type="number" min="1" max="60" value="5" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label for="rounds">Rounds</label>
+            <input id="rounds" type="number" min="1" max="12" value="4" inputmode="numeric">
+          </div>
+        </div>
+        <div class="field">
+          <label for="start">Start time</label>
+          <input id="start" type="datetime-local" step="1">
+          <p class="hint">Leave blank to start now. Your local time.</p>
+        </div>
+        <button type="button" id="start-btn">Start</button>
+        <p class="error" id="start-error" role="alert"></p>
+      </form>
+
+      <div class="field">
+        <span class="label" id="share-label">Share code</span>
+        <div class="row">
+          <input id="share" class="code" type="text" readonly aria-labelledby="share-label" placeholder="Start a session to get a code">
+          <button type="button" class="secondary" id="copy-btn">Copy</button>
+        </div>
+        <p class="hint">Send this to your study partner.</p>
+      </div>
+    </section>
+
+    <!-- Join -->
+    <section class="panel">
+      <h2>Join a partner's session</h2>
+      <div class="field">
+        <label for="join">Join</label>
+        <div class="row">
+          <input id="join" class="code" type="text" placeholder="Paste a share code" autocomplete="off" spellcheck="false">
+          <button type="button" id="join-btn">Join</button>
+        </div>
+        <p class="error" id="join-error" role="alert"></p>
+      </div>
+    </section>
+  </div>
+
+  <p class="note">Timers use each device's clock, so small differences between devices may occur.
+    Your clock reads <span class="digits" id="my-clock">--:--:--</span>. Compare it with your partner's if your countdowns look different.</p>
+  <details class="selfcheck">
+    <summary id="selfcheck">Self-check: not run yet</summary>
+    <ul id="selfcheck-list"></ul>
+  </details>
+</div>
+
+<script>
+// ===== A. Constants =====
+const FORMAT_VERSION = '1';
+const LIMITS = {
+  focus:  { min: 1, max: 180 },  // minutes
+  break:  { min: 1, max: 60 },   // minutes
+  rounds: { min: 1, max: 12 },
+};
+
+// ===== B. Pure functions (no DOM access) =====
+
+const START_MIN_SEC = Date.UTC(2020, 0, 1) / 1000;  // earliest allowed start
+const START_MAX_SEC = Date.UTC(2100, 0, 1) / 1000;  // latest allowed start
+const LABELS = { focus: 'Focus minutes', break: 'Break minutes', rounds: 'Rounds' };
+
+// Returns null if the session is valid, otherwise an error message.
+function validateSession(session) {
+  if (!session || typeof session !== 'object') return 'No session settings were given.';
+  for (const key of ['focus', 'break', 'rounds']) {
+    const value = session[key];
+    const { min, max } = LIMITS[key];
+    if (!Number.isInteger(value) || value < min || value > max) {
+      return `${LABELS[key]} must be a whole number from ${min} to ${max}.`;
+    }
+  }
+  const startSec = session.startUtc / 1000;
+  if (!Number.isFinite(startSec) || startSec < START_MIN_SEC || startSec >= START_MAX_SEC) {
+    return 'Start time must be between the years 2020 and 2099.';
+  }
+  return null;
+}
+
+// { focus, break, rounds, startUtc (epoch ms) } -> share code string
+// Format: version-focus-break-rounds-startSeconds-checksum, all base36.
+function encodeSession({ focus, break: brk, rounds, startUtc }) {
+  const error = validateSession({ focus, break: brk, rounds, startUtc });
+  if (error) throw new Error(error);
+  const startSec = Math.round(startUtc / 1000);
+  const body = [FORMAT_VERSION, focus, brk, rounds, startSec]
+    .map((v, i) => (i === 0 ? v : v.toString(36)))
+    .join('-');
+  return `${body}-${checksum(body)}`;
+}
+
+// code -> { ok: true, session } | { ok: false, error }
+function decodeSession(code) {
+  const fail = error => ({ ok: false, error });
+  if (typeof code !== 'string') return fail('Paste a share code first.');
+
+  // Forgive spaces, line breaks and capital letters picked up in chat apps.
+  const clean = code.replace(/\s+/g, '').toLowerCase();
+  if (!clean) return fail('Paste a share code first.');
+  if (!/^[0-9a-z-]+$/.test(clean)) {
+    return fail('This code has characters that don\'t belong. Codes use only letters, digits and dashes.');
+  }
+
+  const parts = clean.split('-');
+  if (parts.length !== 6 || parts.some(p => p === '')) {
+    return fail('This code is incomplete or has extra pieces. Copy the whole code again.');
+  }
+  if (parts[0] !== FORMAT_VERSION) {
+    return fail('This code was made by a different version of the timer.');
+  }
+
+  const body = parts.slice(0, 5).join('-');
+  if (checksum(body) !== parts[5]) {
+    return fail('This code doesn\'t check out. Look for a typo, or copy it again.');
+  }
+
+  const [focus, brk, rounds, startSec] = parts.slice(1, 5).map(p => parseInt(p, 36));
+  const session = { focus, break: brk, rounds, startUtc: startSec * 1000 };
+  const error = validateSession(session);
+  if (error) return fail(`This code has a bad setting. ${error}`);
+  return { ok: true, session };
+}
+
+// checksum(str) -> two base36 characters.
+// Position-weighted sum of character codes, mod 36^2. For codes this short,
+// any single changed character always changes the result.
+function checksum(str) {
+  let sum = 0;
+  for (let i = 0; i < str.length; i++) sum += (i + 1) * str.charCodeAt(i);
+  return (sum % 1296).toString(36).padStart(2, '0');
+}
+
+// (session, nowMs) -> { state, round, totalRounds, remainingMs, phaseEndsAt }
+// state is one of 'not started' | 'focus' | 'break' | 'finished'
+// Each round is focus then break, except the last round has no break.
+function getPhase(session, nowMs) {
+  const { focus, break: brk, rounds, startUtc } = session;
+  const focusMs = focus * 60000;
+  const cycleMs = (focus + brk) * 60000;
+  const totalMs = rounds * focusMs + (rounds - 1) * brk * 60000;
+  const elapsed = nowMs - startUtc;
+  const base = { totalRounds: rounds };
+
+  if (elapsed < 0) {
+    return { ...base, state: 'not started', round: 0, remainingMs: -elapsed, phaseEndsAt: startUtc };
+  }
+  if (elapsed >= totalMs) {
+    return { ...base, state: 'finished', round: rounds, remainingMs: 0, phaseEndsAt: null };
+  }
+  const index = Math.floor(elapsed / cycleMs);
+  const intoCycle = elapsed - index * cycleMs;
+  const cycleStart = startUtc + index * cycleMs;
+  if (intoCycle < focusMs) {
+    return { ...base, state: 'focus', round: index + 1, remainingMs: focusMs - intoCycle, phaseEndsAt: cycleStart + focusMs };
+  }
+  return { ...base, state: 'break', round: index + 1, remainingMs: cycleMs - intoCycle, phaseEndsAt: cycleStart + cycleMs };
+}
+
+// ms -> "mm:ss" or "h:mm:ss". Rounds up, so the display reads 00:01 until the exact boundary.
+function formatClock(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+// ===== C. Self-tests =====
+const SAMPLES = [
+  { focus: 25,  break: 5,  rounds: 4,  startUtc: Date.UTC(2026, 9, 17, 18, 0, 0) },    // 2026-10-17 18:00 UTC
+  { focus: 50,  break: 10, rounds: 3,  startUtc: Date.UTC(2026, 9, 20, 15, 30, 0) },   // 2026-10-20 15:30 UTC
+  { focus: 1,   break: 1,  rounds: 1,  startUtc: Date.UTC(2020, 0, 1, 0, 0, 0) },      // smallest values
+  { focus: 180, break: 60, rounds: 12, startUtc: Date.UTC(2099, 11, 31, 23, 59, 59) }, // largest values
+];
+
+const MIN = 60000;
+const PHASE_SESSION = { focus: 25, break: 5, rounds: 2, startUtc: Date.UTC(2026, 9, 17, 18, 0, 0) };
+// [label, offset from start, expected state, round, remaining ms]
+const PHASE_CASES = [
+  ['start −2:00', -2 * MIN, 'not started', 0, 2 * MIN],
+  ['start +0', 0, 'focus', 1, 25 * MIN],
+  ['+24:59', 24 * MIN + 59000, 'focus', 1, 1000],
+  ['+25:00', 25 * MIN, 'break', 1, 5 * MIN],
+  ['+31:00', 31 * MIN, 'focus', 2, 24 * MIN],
+  ['+54:59', 54 * MIN + 59000, 'focus', 2, 1000],
+  ['+55:00', 55 * MIN, 'finished', 2, 0],
+  ['+60:00', 60 * MIN, 'finished', 2, 0],
+];
+
+// Builds a code with a correct checksum around any body, to test range checks.
+const withChecksum = body => `${body}-${checksum(body)}`;
+
+const sameSession = (a, b) =>
+  a.focus === b.focus && a.break === b.break && a.rounds === b.rounds && a.startUtc === b.startUtc;
+
+const decodesTo = (code, expected) => {
+  const r = decodeSession(code);
+  return r.ok && sameSession(r.session, expected);
+};
+
+const failsWith = (code, text) => {
+  const r = decodeSession(code);
+  return !r.ok && r.error.includes(text);
+};
+
+function runSelfTests() {
+  const code0 = encodeSession(SAMPLES[0]);
+  const t = (name, fn) => {
+    try { return { name, pass: fn() === true }; }
+    catch (e) { return { name, pass: false, note: e.message }; }
+  };
+
+  const results = [
+    // Valid round trips
+    ...SAMPLES.map(s => t(`Round trip ${s.focus}/${s.break}/${s.rounds} → ${encodeSession(s)}`,
+      () => decodesTo(encodeSession(s), s))),
+    t('Codes use only 0-9, a-z and dashes, max 20 characters',
+      () => SAMPLES.every(s => /^[0-9a-z-]{1,20}$/.test(encodeSession(s)))),
+    t('Spaces, line breaks and capitals around a code are ignored',
+      () => decodesTo(`  ${code0.toUpperCase()}\n`, SAMPLES[0])),
+    t('Every single-character change to a code is rejected', () => {
+      const chars = '0123456789abcdefghijklmnopqrstuvwxyz-';
+      for (let i = 0; i < code0.length; i++) {
+        for (const c of chars) {
+          if (c === code0[i]) continue;
+          const bad = code0.slice(0, i) + c + code0.slice(i + 1);
+          if (decodeSession(bad).ok) return false;
+        }
+      }
+      return true;
+    }),
+
+    // Invalid codes
+    t('Empty input → "Paste a share code first"', () => failsWith('', 'Paste a share code first')),
+    t('Only spaces → "Paste a share code first"', () => failsWith('   \n ', 'Paste a share code first')),
+    t('"hello" → incomplete', () => failsWith('hello', 'incomplete')),
+    t('Missing last piece → incomplete', () => failsWith(code0.slice(0, code0.lastIndexOf('-')), 'incomplete')),
+    t('Symbols → characters that don\'t belong', () => failsWith('1-p-5-4-tn2co0-$$', 'characters that don\'t belong')),
+    t('Version 2 → different version', () => failsWith(withChecksum('2-p-5-4-tn2co0'), 'different version')),
+    t('Focus 0 → bad setting', () => failsWith(withChecksum('1-0-5-4-tn2co0'), 'Focus minutes must be')),
+    t('Break 0 → bad setting', () => failsWith(withChecksum('1-p-0-4-tn2co0'), 'Break minutes must be')),
+    t('Rounds 0 → bad setting', () => failsWith(withChecksum('1-p-5-0-tn2co0'), 'Rounds must be')),
+    t('Rounds 13 → bad setting', () => failsWith(withChecksum('1-p-5-d-tn2co0'), 'Rounds must be')),
+    t('Focus 181 → bad setting', () => failsWith(withChecksum('1-51-5-4-tn2co0'), 'Focus minutes must be')),
+    t('Start in 2019 → bad setting', () => failsWith(withChecksum('1-p-5-4-' + (START_MIN_SEC - 1).toString(36)), 'Start time')),
+    t('encodeSession refuses focus 0', () => {
+      try { encodeSession({ ...SAMPLES[0], focus: 0 }); return false; }
+      catch (e) { return e.message.includes('Focus minutes'); }
+    }),
+
+    // Phase checkpoints for 25 / 5 / 2 rounds
+    ...PHASE_CASES.map(([label, offset, st, round, remaining]) =>
+      t(`25/5/2 at ${label} → ${st}, round ${round}, ${formatClock(remaining)}`, () => {
+        const p = getPhase(PHASE_SESSION, PHASE_SESSION.startUtc + offset);
+        return p.state === st && p.round === round && p.remainingMs === remaining;
+      })),
+    t('Late joiner and creator see the same phase at the same moment', () => {
+      const now = PHASE_SESSION.startUtc + 7 * MIN + 12345;
+      const joined = decodeSession(encodeSession(PHASE_SESSION)).session;
+      return JSON.stringify(getPhase(joined, now)) === JSON.stringify(getPhase(PHASE_SESSION, now));
+    }),
+
+    // Clock formatting
+    ...[[1000, '00:01'], [1001, '00:02'], [25 * MIN, '25:00'], [60 * MIN, '1:00:00'], [0, '00:00'], [-5, '00:00']]
+      .map(([ms, text]) => t(`formatClock(${ms}) → ${text}`, () => formatClock(ms) === text)),
+  ];
+
+  const failed = results.filter(r => !r.pass);
+  if (failed.length) console.warn('Self-check failures:', failed);
+  return { passed: results.length - failed.length, total: results.length, results };
+}
+
+// ===== D. UI =====
+const $ = id => document.getElementById(id);
+const state = { session: null, phaseKey: null, audio: null };
+
+const pad2 = n => String(n).padStart(2, '0');
+// epoch ms -> value for <input type="datetime-local">, in this device's time zone
+function toLocalInputValue(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
+    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+const localTime = ms => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+const utcTime = ms => new Date(ms).toISOString().slice(11, 16) + ' UTC';
+
+const PILL = { 'not started': 'Starts in', focus: 'Focus', break: 'Break', finished: 'Finished' };
+
+function render() {
+  const now = Date.now();
+  $('my-clock').textContent = new Date(now).toISOString().slice(11, 19) + ' UTC';
+  const s = state.session;
+  if (!s) return;
+
+  const p = getPhase(s, now);
+  $('timer').dataset.state = p.state;
+  $('phase').textContent = PILL[p.state];
+  $('clock').textContent = p.state === 'finished' ? '00:00' : formatClock(p.remainingMs);
+  $('round').textContent =
+    p.state === 'not started' ? `Session starts at ${localTime(s.startUtc)}` :
+    p.state === 'finished' ? `Session finished. ${s.rounds} of ${s.rounds} rounds done.` :
+    `Round ${p.round} of ${p.totalRounds}`;
+  $('settings').textContent =
+    `${s.focus} min focus · ${s.break} min break · ${s.rounds} rounds · ` +
+    `starts ${localTime(s.startUtc)} your time (${utcTime(s.startUtc)})`;
+  document.title = p.state === 'finished'
+    ? 'Finished · Study Timer'
+    : `${PILL[p.state]} ${$('clock').textContent} · Study Timer`;
+
+  // Beep when the phase changes while the page is open (not on first load).
+  const key = `${p.state}-${p.round}`;
+  if (state.phaseKey && key !== state.phaseKey) beep();
+  state.phaseKey = key;
+}
+
+function loadSession(session) {
+  state.session = session;
+  state.phaseKey = null;
+  $('share').value = encodeSession(session);
+  $('focus').value = session.focus;
+  $('break').value = session.break;
+  $('rounds').value = session.rounds;
+  $('start').value = toLocalInputValue(session.startUtc);
+  $('start-error').textContent = '';
+  $('join-error').textContent = '';
+  render();
+}
+
+// Sound can only start after a click, so each button unlocks it.
+function unlockSound() {
+  try {
+    state.audio ||= new (window.AudioContext || window.webkitAudioContext)();
+    state.audio.resume();
+  } catch { /* no sound available; the tab title still shows the phase */ }
+}
+function beep() {
+  const ctx = state.audio;
+  if (!ctx) return;
+  try {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.6);
+  } catch { /* ignore */ }
+}
+
+$('start-btn').addEventListener('click', () => {
+  unlockSound();
+  const raw = $('start').value;
+  // "Now" is cut to the whole second so the share code reproduces it exactly.
+  const startUtc = raw ? new Date(raw).getTime() : Math.floor(Date.now() / 1000) * 1000;
+  const session = {
+    focus: Number($('focus').value),
+    break: Number($('break').value),
+    rounds: Number($('rounds').value),
+    startUtc,
+  };
+  const error = validateSession(session);
+  if (error) { $('start-error').textContent = error; return; }
+  loadSession(session);
+});
+
+function join() {
+  unlockSound();
+  const result = decodeSession($('join').value);
+  if (!result.ok) { $('join-error').textContent = result.error; return; }
+  loadSession(result.session);
+}
+$('join-btn').addEventListener('click', join);
+$('join').addEventListener('keydown', e => { if (e.key === 'Enter') join(); });
+
+$('copy-btn').addEventListener('click', async () => {
+  const code = $('share').value;
+  if (!code) return;
+  const button = $('copy-btn');
+  try {
+    await navigator.clipboard.writeText(code);
+    button.textContent = 'Copied';
+  } catch {
+    $('share').select();
+    button.textContent = 'Press ⌘C / Ctrl+C';
+  }
+  setTimeout(() => { button.textContent = 'Copy'; }, 1800);
+});
+
+render();
+setInterval(render, 250);
+
+const report = runSelfTests();
+$('selfcheck').textContent = `Self-check: ${report.passed}/${report.total} passed`;
+for (const r of report.results) {
+  const li = document.createElement('li');
+  li.textContent = `${r.pass ? '✓' : '✗'} ${r.name}${r.note ? ` (${r.note})` : ''}`;
+  if (!r.pass) li.className = 'fail';
+  $('selfcheck-list').append(li);
+}
+</script>

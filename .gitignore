@@ -1,0 +1,4 @@
+.DS_Store
+# Build output: rebuild with menubar/build.sh, or download from Releases
+*.app
+*.zip

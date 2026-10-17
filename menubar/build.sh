@@ -1,0 +1,35 @@
+#!/bin/zsh
+# Builds StudyTimerBar.app next to this script.
+set -euo pipefail
+cd "${0:A:h}"
+
+APP=StudyTimerBar.app
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS"
+
+# Universal binary (Apple Silicon + Intel) that runs on macOS 13 and later.
+TMP=$(mktemp -d)
+swiftc -O -swift-version 5 -target arm64-apple-macos13 StudyTimerBar.swift -o "$TMP/arm64"
+swiftc -O -swift-version 5 -target x86_64-apple-macos13 StudyTimerBar.swift -o "$TMP/x86_64"
+lipo -create "$TMP/arm64" "$TMP/x86_64" -output "$APP/Contents/MacOS/StudyTimerBar"
+rm -rf "$TMP"
+
+cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Study Timer</string>
+  <key>CFBundleIdentifier</key><string>com.braxtonhauw.studytimerbar</string>
+  <key>CFBundleExecutable</key><string>StudyTimerBar</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+
+xattr -cr "$APP"   # Finder/iCloud metadata breaks codesign
+codesign --force --sign - "$APP"
+echo "Built $PWD/$APP"
