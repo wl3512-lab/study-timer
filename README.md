@@ -37,6 +37,8 @@ Live version: https://claude.ai/artifact/JnMKumzc6V92D4AHpx1K9L
 
 It reads and writes the same codes as the web timer.
 
+**In Vorssaint's notch** (`integrations/vorssaint/`): if you use [Vorssaint](https://github.com/vorssaint/vorssaint-utils), a small patch shows your session around the notch the way Vorssaint shows Codex: a live countdown in the island's strip, and a pop-out notice when a break starts, focus resumes, or the session is done. Download **StudyTimer-Vorssaint-Island.zip** from Releases and run its `install.sh`; see [its README](integrations/vorssaint/README.md).
+
 ## How a session works
 
 Each round is a focus block followed by a break, except the last round has no break. A 25 / 5 / 4 session runs 25 + 5 + 25 + 5 + 25 + 5 + 25 = 115 minutes.

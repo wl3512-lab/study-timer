@@ -1,27 +1,40 @@
+diff --git a/Sources/Vorssaint/Core/NotchEditorStrings.swift b/Sources/Vorssaint/Core/NotchEditorStrings.swift
+index eceeb97..494d21d 100644
+--- a/Sources/Vorssaint/Core/NotchEditorStrings.swift
++++ b/Sources/Vorssaint/Core/NotchEditorStrings.swift
+@@ -87,6 +87,7 @@ struct NotchEditorStrings {
+         case .calendar: return calendarSummary
+         case .notifications: return notificationsSummary
+         case .timer: return timerSummary
++        case .study: return "Your Study Timer session: the countdown, rounds and controls."
+         case .camera: return cameraSummary
+         case .downloads: return downloadsSummary
+         case .scratchpad: return scratchpadSummary
 diff --git a/Sources/Vorssaint/Services/Notch/NotchStudyTimerBridge.swift b/Sources/Vorssaint/Services/Notch/NotchStudyTimerBridge.swift
 new file mode 100644
-index 0000000..62402bf
+index 0000000..fa23f47
 --- /dev/null
 +++ b/Sources/Vorssaint/Services/Notch/NotchStudyTimerBridge.swift
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,247 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (C) 2026 Vorssaint
 +
 +import AppKit
++import Combine
 +
-+/// Shows a session from the Study Timer menu bar app in the island's timer
-+/// strip. Study Timer broadcasts its session (start time, focus and break
++/// Shows a session from the Study Timer menu bar app in the island: the Study
++/// page (NotchStudyTimerView) and the timer strip. Study Timer broadcasts its session (start time, focus and break
 +/// lengths, rounds, pause) as a distributed notification; the island mirrors
 +/// the current phase as a read-only pomodoro and sends the strip's pause, skip
 +/// and stop back to Study Timer. A timer started in Vorssaint always wins: a
 +/// mirror never replaces it.
-+final class NotchStudyTimerBridge {
++final class NotchStudyTimerBridge: ObservableObject {
 +    static let shared = NotchStudyTimerBridge()
 +    static let stateNotification = Notification.Name("com.braxtonhauw.studytimer.state")
 +    static let requestNotification = Notification.Name("com.braxtonhauw.studytimer.request")
 +    static let commandNotification = Notification.Name("com.braxtonhauw.studytimer.command")
 +
-+    enum Command: String { case togglePause, skip, end }
++    enum Command: String { case togglePause, skip, end, start }
 +
 +    struct Session: Equatable {
 +        let focus: Int        // minutes
@@ -45,10 +58,16 @@ index 0000000..62402bf
 +
 +    private var stateObserver: NSObjectProtocol?
 +    private var wakeObserver: NSObjectProtocol?
-+    private var session: Session?
++    @Published private(set) var session: Session?
++    /// The session's share code, for the Study page's Copy button.
++    @Published private(set) var code: String?
 +    private var boundary: DispatchWorkItem?
 +    /// The phase last shown, so a change can be announced like a finished agent task.
 +    private var lastKey: String?
++    /// Study Timer answered or announced itself and has not quit since, so a
++    /// pomodoro started here runs there.
++    @Published private(set) var studyTimerRunning = false
++    private var pendingStart: DispatchWorkItem?
 +    private init() {}
 +
 +    func start() {
@@ -62,10 +81,25 @@ index 0000000..62402bf
 +            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
 +            self?.reapply()
 +        }
-+        // A Study Timer that is already running repeats its session.
++        ask()
++    }
++
++    /// A Study Timer that is running repeats its session.
++    func ask() {
 +        DistributedNotificationCenter.default().postNotificationName(
 +            Self.requestNotification, object: nil, userInfo: nil, deliverImmediately: true)
 +    }
++
++    /// Opens Study Timer, or its download page when it is not installed.
++    func openStudyTimer() {
++        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.studyTimerBundleID) {
++            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
++        } else if let url = URL(string: "https://github.com/bhauw/study-timer/releases") {
++            NSWorkspace.shared.open(url)
++        }
++    }
++
++    static let studyTimerBundleID = "com.braxtonhauw.studytimerbar"
 +
 +    func stop() {
 +        if let stateObserver { DistributedNotificationCenter.default().removeObserver(stateObserver) }
@@ -74,16 +108,50 @@ index 0000000..62402bf
 +        wakeObserver = nil
 +        boundary?.cancel(); boundary = nil
 +        session = nil
++        code = nil
 +        lastKey = nil
++        studyTimerRunning = false
++        pendingStart?.cancel(); pendingStart = nil
 +    }
 +
-+    func send(_ command: Command) {
++    func send(_ command: Command, _ extra: [String: Any] = [:]) {
++        var info = extra
++        info["action"] = command.rawValue
 +        DistributedNotificationCenter.default().postNotificationName(
-+            Self.commandNotification, object: nil, userInfo: ["action": command.rawValue], deliverImmediately: true)
++            Self.commandNotification, object: nil, userInfo: info, deliverImmediately: true)
++    }
++
++    /// Starts a Study Timer session with the island's pomodoro settings. False
++    /// when Study Timer is not running, so the island's own timer starts instead.
++    /// Study Timer has no long breaks: its rounds are the pomodoro's sessions.
++    func startStudySession(_ configuration: NotchPomodoroConfiguration) -> Bool {
++        guard studyTimerRunning else { return false }
++        send(.start, Self.startInfo(configuration))
++        // Study Timer answers with its new session. If it never does (it
++        // quit without saying so), the island's own pomodoro starts instead.
++        pendingStart?.cancel()
++        let fallback = DispatchWorkItem { [weak self] in
++            guard let self else { return }
++            self.pendingStart = nil
++            self.studyTimerRunning = false
++            NotchTimerService.shared.start(mode: .pomodoro, minutes: configuration.focusMinutes)
++        }
++        pendingStart = fallback
++        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: fallback)
++        return true
++    }
++
++    static func startInfo(_ c: NotchPomodoroConfiguration) -> [String: Any] {
++        ["focus": min(180, max(1, c.focusMinutes)),
++         "brk": min(60, max(1, c.shortBreakMinutes)),
++         "rounds": min(12, max(1, c.totalSessions))]
 +    }
 +
 +    private func receive(_ info: [AnyHashable: Any]?) {
++        studyTimerRunning = info?["quitting"] as? Bool != true
++        if Self.session(from: info) != nil { pendingStart?.cancel(); pendingStart = nil }
 +        session = Self.session(from: info)
++        code = session == nil ? nil : info?["code"] as? String
 +        reapply()
 +    }
 +
@@ -195,8 +263,56 @@ index 0000000..62402bf
 +            : Phase(focus: false, round: Int(index) + 1, remaining: cycle - into)
 +    }
 +}
+diff --git a/Sources/Vorssaint/Services/Notch/NotchSupport.swift b/Sources/Vorssaint/Services/Notch/NotchSupport.swift
+index f50afd2..ede7bd3 100644
+--- a/Sources/Vorssaint/Services/Notch/NotchSupport.swift
++++ b/Sources/Vorssaint/Services/Notch/NotchSupport.swift
+@@ -7,7 +7,7 @@ import Foundation
+ import CoreGraphics
+ 
+ enum NotchModule: String, CaseIterable, Identifiable {
+-    case controls, mixer, music, clipboard, captures, files, system, tools, calendar, notifications, timer, camera, downloads, scratchpad, agents, watch
++    case controls, mixer, music, clipboard, captures, files, system, tools, calendar, notifications, timer, study, camera, downloads, scratchpad, agents, watch
+     var id: String { rawValue }
+ 
+     var symbol: String {
+@@ -18,6 +18,8 @@ enum NotchModule: String, CaseIterable, Identifiable {
+         case .mixer: return "speaker.wave.2"
+         case .music: return "music.note"
+         case .timer: return "timer"
++        // The Study Timer app's session (NotchStudyTimerBridge).
++        case .study: return "graduationcap"
+         case .camera: return "web.camera"
+         case .downloads: return "arrow.down.circle"
+         case .notifications: return "bell"
+@@ -48,6 +50,7 @@ enum NotchModule: String, CaseIterable, Identifiable {
+         case .calendar: return "a"
+         case .notifications: return "n"
+         case .timer: return "r"
++        case .study: return "y"
+         case .camera: return "w"
+         case .downloads: return "d"
+         case .scratchpad: return "p"
+@@ -59,7 +62,7 @@ enum NotchModule: String, CaseIterable, Identifiable {
+     func isAvailable(in defaults: UserDefaults = .standard) -> Bool {
+         switch self {
+         case .controls, .music: return true
+-        case .timer: return AppFeature.notchTimer.isAvailable(in: defaults)
++        case .timer, .study: return AppFeature.notchTimer.isAvailable(in: defaults)
+         case .camera: return AppFeature.cameraPreview.isAvailable(in: defaults)
+         case .downloads: return AppFeature.notchDownloads.isAvailable(in: defaults)
+         case .notifications: return AppFeature.notchNotifications.isAvailable(in: defaults)
+@@ -2667,6 +2670,8 @@ struct NotchGeometry: Equatable {
+                     : NotchLayout.railHeight(rows: toolRows(count: toolCount), rowHeight: NotchLayout.toolHeight, spacing: NotchLayout.toolSpacing))
+             case .timer:
+                 contentHeight = min(budget, NotchLayout.timer(mode: timerMode, hasSession: timerHasSession, height: budget))
++            case .study:
++                contentHeight = min(budget, NotchStudyTimerView.preferredHeight)
+             case .agents:
+                 // Only the cards a person chose; a short set leaves a short island.
+                 contentHeight = min(budget, agentsHeight.map { $0 > 0 ? $0 : NotchLayout.emptyHeight } ?? budget)
 diff --git a/Sources/Vorssaint/Services/Notch/NotchTimerService.swift b/Sources/Vorssaint/Services/Notch/NotchTimerService.swift
-index 0e64a32..5c8393b 100644
+index 0e64a32..f858f70 100644
 --- a/Sources/Vorssaint/Services/Notch/NotchTimerService.swift
 +++ b/Sources/Vorssaint/Services/Notch/NotchTimerService.swift
 @@ -15,6 +15,10 @@ final class NotchTimerService: ObservableObject {
@@ -219,16 +335,23 @@ index 0e64a32..5c8393b 100644
          finishIfDue()
          if session.completed { alert.start(enabled: NotchTimerSupport.isSoundEnabled()) }
          scheduleCompletion()
-@@ -32,6 +38,8 @@ final class NotchTimerService: ObservableObject {
+@@ -32,6 +38,15 @@ final class NotchTimerService: ObservableObject {
  
      func start(mode: NotchTimerMode, minutes: Int) {
          guard !suspended, NotchTimerSupport.isEnabled() else { return }
-+        // A timer started here replaces the mirror; Study Timer keeps running.
++        // With Study Timer running, a pomodoro started here runs there, and
++        // its session comes back as the mirror.
++        if mode == .pomodoro, !session.hasSession || mirroring,
++           NotchStudyTimerBridge.shared.startStudySession(.load()) {
++            NotchService.shared.reactMascot(.ready)
++            return
++        }
++        // Any other timer started here replaces the mirror; Study Timer keeps running.
 +        if mirroring { endMirror() }
          guard !session.hasSession else { return }
          alert.stop()
          session.start(mode: mode, minutes: minutes, now: now, configuration: .load())
-@@ -41,6 +49,7 @@ final class NotchTimerService: ObservableObject {
+@@ -41,6 +56,7 @@ final class NotchTimerService: ObservableObject {
  
      func pauseOrResume() {
          guard !suspended, NotchTimerSupport.isEnabled() else { return }
@@ -236,7 +359,7 @@ index 0e64a32..5c8393b 100644
          finishIfDue()
          if session.isRunning { session.pause(at: now) }
          else if session.isPaused { session.resume(at: now) }
-@@ -49,6 +58,7 @@ final class NotchTimerService: ObservableObject {
+@@ -49,6 +65,7 @@ final class NotchTimerService: ObservableObject {
  
      func startNext() {
          guard !suspended, NotchTimerSupport.isEnabled() else { return }
@@ -244,7 +367,7 @@ index 0e64a32..5c8393b 100644
          guard session.canStartNext else { return }
          alert.stop()
          session.startNext(at: now)
-@@ -57,11 +67,14 @@ final class NotchTimerService: ObservableObject {
+@@ -57,11 +74,14 @@ final class NotchTimerService: ObservableObject {
      }
  
      func cancel() {
@@ -259,7 +382,7 @@ index 0e64a32..5c8393b 100644
      }
  
      func suspend() {
-@@ -70,11 +83,31 @@ final class NotchTimerService: ObservableObject {
+@@ -70,11 +90,31 @@ final class NotchTimerService: ObservableObject {
          completionTask?.cancel(); completionTask = nil
          countdownTask?.cancel(); countdownTask = nil
          NotchService.shared.endMascotCountdown(retreating: false)
@@ -291,7 +414,7 @@ index 0e64a32..5c8393b 100644
          guard session.finishIfDue(at: now) else { return }
          alert.stop()
          // The notice takes the strip it watched from.
-@@ -91,6 +124,7 @@ final class NotchTimerService: ObservableObject {
+@@ -91,6 +131,7 @@ final class NotchTimerService: ObservableObject {
  
      private func scheduleCompletion() {
          completionTask?.cancel(); completionTask = nil
@@ -329,3 +452,322 @@ index cf5f6fc..e6b27e6 100644
  }
  
  enum NotchTimerSupport {
+diff --git a/Sources/Vorssaint/UI/Notch/NotchStudyTimerView.swift b/Sources/Vorssaint/UI/Notch/NotchStudyTimerView.swift
+new file mode 100644
+index 0000000..04c0b40
+--- /dev/null
++++ b/Sources/Vorssaint/UI/Notch/NotchStudyTimerView.swift
+@@ -0,0 +1,242 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Vorssaint
++
++import AppKit
++import SwiftUI
++
++/// The island's Study page: the Study Timer app's session, drawn as Study
++/// Timer draws it. A progress ring with a breathing aura, the round dots, and
++/// pause, skip, stop and copy code. With no session it offers presets and the
++/// island's own pomodoro settings; with Study Timer closed, a way to open it.
++/// Every button is a command to Study Timer, which owns the session.
++struct NotchStudyTimerView: View {
++    let size: CGSize
++    @ObservedObject private var bridge = NotchStudyTimerBridge.shared
++    @State private var copied = false
++
++    static let preferredHeight: CGFloat = 156
++
++    var body: some View {
++        Group {
++            if !bridge.studyTimerRunning {
++                NotchEmptyView(symbol: "graduationcap", message: "Study Timer isn't open.") {
++                    NotchPillButton(title: "Open Study Timer", prominent: true) { bridge.openStudyTimer() }
++                }
++            } else if let session = bridge.session {
++                running(session)
++            } else {
++                setup
++            }
++        }
++        .frame(maxWidth: .infinity, maxHeight: .infinity)
++        .onAppear {
++            NotchStudyTimerBridge.shared.start()
++            NotchStudyTimerBridge.shared.ask()
++        }
++    }
++
++    // MARK: No session
++
++    private struct Preset: Identifiable {
++        let focus: Int, brk: Int, rounds: Int
++        var id: String { "\(focus)-\(brk)-\(rounds)" }
++    }
++
++    private var presets: [Preset] {
++        let own = NotchPomodoroConfiguration.load()
++        let island = Preset(focus: own.focusMinutes, brk: own.shortBreakMinutes, rounds: min(12, own.totalSessions))
++        let fixed = [Preset(focus: 25, brk: 5, rounds: 4), Preset(focus: 50, brk: 10, rounds: 3), Preset(focus: 90, brk: 15, rounds: 2)]
++        return fixed.contains(where: { $0.id == island.id }) ? fixed : [island] + fixed
++    }
++
++    private var setup: some View {
++        VStack(spacing: 14) {
++            HStack(spacing: 8) {
++                Image(systemName: "graduationcap").foregroundStyle(Self.color(0x8CCBFF))
++                Text("Start a study session").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
++            }
++            HStack(spacing: 8) {
++                ForEach(presets) { preset in
++                    Button {
++                        bridge.send(.start, ["focus": preset.focus, "brk": preset.brk, "rounds": preset.rounds])
++                    } label: {
++                        VStack(spacing: 2) {
++                            Text("\(preset.focus) / \(preset.brk)")
++                                .font(.system(size: 13, weight: .semibold)).monospacedDigit()
++                            Text("×\(preset.rounds)")
++                                .font(.system(size: 10, weight: .medium)).monospacedDigit()
++                                .foregroundStyle(.white.opacity(0.55))
++                        }
++                        .foregroundStyle(.white)
++                        .frame(minWidth: 64)
++                        .padding(.vertical, 8)
++                        .background(.white.opacity(0.1), in: Capsule())
++                        .contentShape(Capsule())
++                    }
++                    .buttonStyle(NotchButtonStyle(cornerRadius: 18))
++                    .help("\(preset.focus) min focus, \(preset.brk) min break, \(preset.rounds) rounds")
++                }
++            }
++            Text("Runs in Study Timer, with its chimes and share code.")
++                .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
++        }
++        .padding(.horizontal, 12)
++    }
++
++    // MARK: Running
++
++    private func running(_ session: NotchStudyTimerBridge.Session) -> some View {
++        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: session.pausedAt != nil)) { context in
++            let wall = context.date.timeIntervalSince1970
++            let at = session.pausedAt ?? wall
++            let phase = NotchStudyTimerBridge.phase(session, at: at)
++            content(session, phase: phase, wall: wall, at: at)
++        }
++    }
++
++    @ViewBuilder
++    private func content(_ s: NotchStudyTimerBridge.Session, phase: NotchStudyTimerBridge.Phase?,
++                         wall: TimeInterval, at: TimeInterval) -> some View {
++        let paused = s.pausedAt != nil
++        let waiting = phase == nil && at < s.start
++        let finished = phase == nil && !waiting
++        let tint = finished ? Self.color(0xFFD58C) : waiting ? Self.color(0xB9A7FF)
++            : phase?.focus == true ? Self.color(0x8CCBFF) : Self.color(0x7FE6C5)
++        let length = Double((phase?.focus ?? true ? s.focus : s.brk) * 60)
++        let progress = finished ? 1 : waiting ? 0 : min(1, max(0, 1 - (phase?.remaining ?? 0) / max(1, length)))
++        let remaining = waiting ? s.start - at : (phase?.remaining ?? 0)
++        let diameter = max(84, min(size.height - 20, 128))
++
++        HStack(spacing: 20) {
++            ring(diameter: diameter, progress: progress, tint: tint, paused: paused,
++                 breath: Self.breath(elapsed: at - s.start, remaining: remaining, active: phase != nil),
++                 reading: finished ? "done" : Self.clock(remaining))
++
++            VStack(alignment: .leading, spacing: 9) {
++                HStack(spacing: 8) {
++                    Text(paused ? "paused" : finished ? "session complete" : waiting ? "starts soon"
++                         : phase?.focus == true ? "focus" : "break")
++                        .font(.system(size: 14, weight: .semibold))
++                        .foregroundStyle(paused ? Color.white.opacity(0.6) : tint)
++                    Text(String(format: "round %02d / %02d", phase?.round ?? (finished ? s.rounds : 1), s.rounds))
++                        .font(.system(size: 11, weight: .medium, design: .monospaced))
++                        .foregroundStyle(.white.opacity(0.5))
++                }
++                Text(Self.nextLine(s, phase: phase, finished: finished, waiting: waiting, paused: paused, wall: wall))
++                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
++                    .lineLimit(1)
++                dots(s, phase: phase, finished: finished, tint: tint)
++                controls(s, finished: finished, paused: paused)
++            }
++            Spacer(minLength: 0)
++        }
++        .padding(.horizontal, 14)
++    }
++
++    private func ring(diameter: CGFloat, progress: Double, tint: Color, paused: Bool,
++                      breath: Double, reading: String) -> some View {
++        ZStack {
++            Circle()
++                // Kept inside the island at its fullest breath, so the
++                // island's edges never seem to move as it breathes.
++                .fill(RadialGradient(gradient: Gradient(colors: [tint, tint.opacity(0)]),
++                                     center: .center, startRadius: 0, endRadius: diameter * 0.6))
++                .frame(width: diameter * 1.2, height: diameter * 1.2)
++                .scaleEffect(paused ? 0.9 : 0.9 + 0.14 * breath)
++                .opacity(paused ? 0.15 : 0.25 + 0.35 * breath)
++                .blur(radius: 12)
++                .allowsHitTesting(false)
++            Circle().stroke(.white.opacity(0.12), lineWidth: 6)
++            Circle()
++                .trim(from: 0, to: progress)
++                .stroke(tint, style: StrokeStyle(lineWidth: 6, lineCap: .round))
++                .rotationEffect(.degrees(-90))
++                .shadow(color: tint.opacity(0.6), radius: 5)
++            Text(reading)
++                .font(.system(size: diameter * 0.21, weight: .semibold, design: .monospaced))
++                .monospacedDigit()
++                .foregroundStyle(paused ? Color.white.opacity(0.55) : Color.white)
++                .lineLimit(1).minimumScaleFactor(0.6)
++                .padding(.horizontal, 10)
++        }
++        .frame(width: diameter, height: diameter)
++        .accessibilityElement(children: .combine)
++    }
++
++    private func dots(_ s: NotchStudyTimerBridge.Session, phase: NotchStudyTimerBridge.Phase?,
++                      finished: Bool, tint: Color) -> some View {
++        HStack(spacing: 7) {
++            ForEach(1...max(1, s.rounds), id: \.self) { round in
++                let done = finished || (phase.map { round < $0.round || (round == $0.round && !$0.focus) } ?? false)
++                let current = !finished && phase?.round == round && phase?.focus == true
++                Circle()
++                    .fill(done ? Color.white : current ? tint : Color.clear)
++                    .overlay(Circle().strokeBorder(done || current ? Color.clear : Color.white.opacity(0.3), lineWidth: 1))
++                    .frame(width: 8, height: 8)
++                    .shadow(color: current ? tint : .clear, radius: 4)
++            }
++        }
++        .accessibilityHidden(true)
++    }
++
++    @ViewBuilder
++    private func controls(_ s: NotchStudyTimerBridge.Session, finished: Bool, paused: Bool) -> some View {
++        HStack(spacing: 6) {
++            if finished {
++                NotchPillButton(title: "Go again", prominent: true) {
++                    bridge.send(.start, ["focus": s.focus, "brk": s.brk, "rounds": s.rounds])
++                }
++                NotchPillButton(title: "Done") { bridge.send(.end) }
++            } else {
++                NotchIconButton(symbol: paused ? "play.fill" : "pause.fill", title: paused ? "Resume" : "Pause") {
++                    bridge.send(.togglePause)
++                }
++                NotchIconButton(symbol: "forward.end.fill", title: "Skip to next phase") { bridge.send(.skip) }
++                NotchIconButton(symbol: "stop.fill", title: "End session") { bridge.send(.end) }
++                if let code = bridge.code {
++                    NotchPillButton(title: copied ? "Copied" : "Copy code") {
++                        NSPasteboard.general.clearContents()
++                        NSPasteboard.general.setString(code, forType: .string)
++                        copied = true
++                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
++                    }
++                    .help("Copy the share code so a friend can study in sync")
++                }
++            }
++        }
++    }
++
++    // MARK: Helpers (Study Timer's own rules)
++
++    /// One breath every 6 seconds, every 2 in a phase's last minute, on the session clock.
++    static func breath(elapsed: TimeInterval, remaining: TimeInterval, active: Bool) -> Double {
++        let cycle = active && remaining <= 60 ? 2.0 : 6.0
++        return (1 - cos(2 * Double.pi * elapsed / cycle)) / 2
++    }
++
++    static func clock(_ seconds: TimeInterval) -> String {
++        let total = max(0, Int(seconds.rounded(.up)))
++        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
++        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
++    }
++
++    static func nextLine(_ s: NotchStudyTimerBridge.Session, phase: NotchStudyTimerBridge.Phase?,
++                         finished: Bool, waiting: Bool, paused: Bool, wall: TimeInterval) -> String {
++        if finished { return "\(NotchStudyTimerBridge.minutes(s.rounds * s.focus)) focused" }
++        if paused { return "press play to resume" }
++        if waiting { return "starts at \(time(s.start))" }
++        guard let phase else { return "" }
++        let ends = time(wall + phase.remaining)
++        if phase.focus { return phase.round == s.rounds ? "ends at \(ends)" : "\(s.brk) min break at \(ends)" }
++        return "round \(phase.round + 1) at \(ends)"
++    }
++
++    static func time(_ epoch: TimeInterval) -> String {
++        Date(timeIntervalSince1970: epoch).formatted(date: .omitted, time: .shortened).lowercased()
++    }
++
++    static func color(_ hex: UInt32) -> Color {
++        Color(.sRGB, red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255,
++              blue: Double(hex & 0xFF) / 255, opacity: 1)
++    }
++}
+diff --git a/Sources/Vorssaint/UI/Notch/NotchView.swift b/Sources/Vorssaint/UI/Notch/NotchView.swift
+index 14bca28..04be630 100644
+--- a/Sources/Vorssaint/UI/Notch/NotchView.swift
++++ b/Sources/Vorssaint/UI/Notch/NotchView.swift
+@@ -560,6 +560,7 @@ struct NotchView: View {
+         } else {
+             switch service.selected {
+             case .timer: NotchTimerView(size: pageSize)
++            case .study: NotchStudyTimerView(size: pageSize)
+             case .camera:
+                 NotchCameraView(size: pageSize)
+                     .notchBand(leading: { NotchCameraChooser() }, trailing: { NotchCameraStopButton() })
+@@ -810,6 +811,7 @@ extension NotchModule: PanelOrderItem {
+     func title(_ language: AppLanguage) -> String {
+         switch self {
+         case .timer: return FeatureStrings.notchActivities(language).timer
++        case .study: return "Study"
+         case .camera: return FeatureStrings.notchActivities(language).camera
+         case .notifications: return FeatureStrings.notchNotifications(language).title
+         case .downloads: return FeatureStrings.notchFiles(language).downloadsTitle
+diff --git a/Sources/Vorssaint/UI/Settings/NotchContentEditor.swift b/Sources/Vorssaint/UI/Settings/NotchContentEditor.swift
+index 91a14b1..d0be0c2 100644
+--- a/Sources/Vorssaint/UI/Settings/NotchContentEditor.swift
++++ b/Sources/Vorssaint/UI/Settings/NotchContentEditor.swift
+@@ -156,6 +156,7 @@ struct NotchPagePreview: View {
+     var body: some View {
+         switch module {
+         case .timer: NotchTimerView(size: size)
++        case .study: NotchStudyTimerView(size: size)
+         case .camera: camera
+         // The island hands these rows their clearing from outside the page.
+         case .notifications:
+@@ -404,6 +405,7 @@ extension NotchModule {
+         case .calendar: return .red
+         case .notifications: return .orange
+         case .timer: return .mint
++        case .study: return .indigo
+         case .camera: return .teal
+         case .downloads: return .blue
+         case .scratchpad: return .yellow
+diff --git a/Sources/Vorssaint/UI/Settings/NotchSettings.swift b/Sources/Vorssaint/UI/Settings/NotchSettings.swift
+index 0c451b8..2a061bb 100644
+--- a/Sources/Vorssaint/UI/Settings/NotchSettings.swift
++++ b/Sources/Vorssaint/UI/Settings/NotchSettings.swift
+@@ -384,7 +384,7 @@ struct NotchSettings: View {
+ 
+     /// The mixer, the system page and the tools arrange themselves in the island.
+     private func hasOptions(_ module: NotchModule) -> Bool {
+-        ![.mixer, .system, .tools].contains(module)
++        ![.mixer, .system, .tools, .study].contains(module)
+     }
+ 
+     @ViewBuilder private func moduleOptions(_ module: NotchModule) -> some View {
+@@ -520,7 +520,7 @@ struct NotchSettings: View {
+         case .watch:
+             NotchWatchSettingsControls()
+                 .toggleStyle(TrailingSwitchToggleStyle())
+-        case .mixer, .system, .tools:
++        case .mixer, .system, .tools, .study:
+             EmptyView()
+         }
+     }
+@@ -845,7 +845,7 @@ struct NotchSettings: View {
+         case .tools: return .quickLauncher
+         case .calendar: return .notchCalendar
+         case .notifications: return .notchNotifications
+-        case .timer: return .notchTimer
++        case .timer, .study: return .notchTimer
+         case .camera: return .cameraPreview
+         case .downloads: return .notchDownloads
+         case .scratchpad: return .scratchpad

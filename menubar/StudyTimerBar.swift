@@ -224,6 +224,30 @@ enum Broadcast {
         return ["active": true, "focus": s.focus, "brk": s.brk, "rounds": s.rounds,
                 "startUtc": s.startUtc, "pausedAt": pausedAt ?? 0, "code": encode(s)]
     }
+
+    enum Command: Equatable {
+        case start(focus: Int, brk: Int, rounds: Int)
+        case togglePause, skip, end, unknown
+    }
+
+    // A command from another app. "start" brings focus, brk and rounds, kept
+    // inside Study Timer's limits.
+    static func command(from info: [AnyHashable: Any]?) -> Command {
+        func int(_ key: String) -> Int? {
+            if let n = info?[key] as? Int { return n }
+            if let n = info?[key] as? NSNumber { return n.intValue }
+            return nil
+        }
+        switch info?["action"] as? String {
+        case "start":
+            guard let f = int("focus"), let b = int("brk"), let r = int("rounds") else { return .unknown }
+            return .start(focus: min(180, max(1, f)), brk: min(60, max(1, b)), rounds: min(12, max(1, r)))
+        case "togglePause": return .togglePause
+        case "skip": return .skip
+        case "end": return .end
+        default: return .unknown
+        }
+    }
 }
 
 // ----- Background sound -----
@@ -385,6 +409,13 @@ func runTests() -> Bool {
     check("broadcast carries the session", info["active"] as? Bool == true && info["focus"] as? Int == 25
           && info["rounds"] as? Int == 2 && info["startUtc"] as? Double == s.startUtc)
     check("broadcast with no session says inactive", Broadcast.info(session: nil, pausedAt: nil)["active"] as? Bool == false)
+    check("start command from Vorssaint parses",
+          Broadcast.command(from: ["action": "start", "focus": 50, "brk": 10, "rounds": 3]) == .start(focus: 50, brk: 10, rounds: 3))
+    check("start command is kept inside the limits",
+          Broadcast.command(from: ["action": "start", "focus": 500, "brk": 0, "rounds": 24]) == .start(focus: 180, brk: 1, rounds: 12))
+    check("pause, skip and end commands parse",
+          Broadcast.command(from: ["action": "togglePause"]) == .togglePause && Broadcast.command(from: ["action": "skip"]) == .skip
+          && Broadcast.command(from: ["action": "end"]) == .end && Broadcast.command(from: ["action": "launch-rockets"]) == .unknown)
 
     // Background sound: every kind makes sound, never clips, and fades to silence.
     for kind in AmbientKind.allCases where kind != .off {
@@ -727,14 +758,25 @@ final class TimerModel: ObservableObject {
     }
 
     // Pause, skip and end from another app (Vorssaint's notch buttons).
-    func handle(command: String) {
-        guard session != nil else { return }
+    func handle(_ command: Broadcast.Command) {
         switch command {
-        case "togglePause": togglePause()
-        case "skip": skip()
-        case "end": end()
-        default: break
+        case .start(let focus, let brk, let rounds):
+            // Starting from Vorssaint's pomodoro: also make it the setup shown here.
+            defaults.set(focus, forKey: "setupFocus")
+            defaults.set(brk, forKey: "setupBreak")
+            defaults.set(rounds, forKey: "setupRounds")
+            start(focus: focus, brk: brk, rounds: rounds)
+        case .togglePause: if session != nil { togglePause() }
+        case .skip: if session != nil { skip() }
+        case .end: if session != nil { end() }
+        case .unknown: break
         }
+    }
+
+    // Lets listeners know Study Timer is gone, so they stop sending it commands.
+    func broadcastQuit() {
+        DistributedNotificationCenter.default().postNotificationName(
+            Broadcast.state, object: nil, userInfo: ["active": false, "quitting": true], deliverImmediately: true)
     }
 
     func copyCode() {
@@ -1026,11 +1068,14 @@ func registerBundledFonts() {
 
 // ----- Reusable pieces -----
 
+// The aura stays inside the panel at its fullest breath (228 × 1.04 plus the
+// blur is under the panel's 320 points), so the panel's edges never seem to
+// move as it breathes. A wider glow got cut off at the edges.
 struct Glow: View {
     let tint: Color
     let breath: Double   // 0...1
     let dimmed: Bool
-    var size: CGFloat = 300
+    var size: CGFloat = 228
 
     var body: some View {
         let strength = Aura.t.glow
@@ -1038,9 +1083,9 @@ struct Glow: View {
             .fill(RadialGradient(gradient: Gradient(colors: [tint, tint.opacity(0)]),
                                  center: .center, startRadius: 0, endRadius: size / 2))
             .frame(width: size, height: size)
-            .scaleEffect(dimmed ? 0.9 : 0.88 + 0.2 * breath)
+            .scaleEffect(dimmed ? 0.9 : 0.9 + 0.14 * breath)
             .opacity((dimmed ? 0.2 : 0.35 + 0.4 * breath) * strength)
-            .blur(radius: 22)
+            .blur(radius: 18)
             .allowsHitTesting(false)
             .accessibilityHidden(true)
     }
@@ -1846,19 +1891,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { self?.model.reschedule() }
         }
 
-        // Other apps can ask for the session and send pause, skip and end.
+        // Other apps can ask for the session, start one, and send pause, skip and end.
         let distributed = DistributedNotificationCenter.default()
         distributed.addObserver(forName: Broadcast.request, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.model.broadcast() }
         }
         distributed.addObserver(forName: Broadcast.command, object: nil, queue: .main) { [weak self] note in
-            let action = note.userInfo?["action"] as? String ?? ""
-            MainActor.assumeIsolated { self?.model.handle(command: action) }
+            let command = Broadcast.command(from: note.userInfo)
+            MainActor.assumeIsolated { self?.model.handle(command) }
         }
         model.broadcast()
 
         model.tick()
         updateButton()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.broadcastQuit()
     }
 
     @objc func togglePopover() {
