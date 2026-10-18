@@ -208,6 +208,24 @@ func parseInvite(_ text: String) -> (code: String?, link: String?) {
     return (code, link)
 }
 
+// ----- Broadcast to other apps -----
+
+// Study Timer announces its session to other apps on this Mac (for example a
+// Vorssaint build with the Study Timer patch, which shows it in the notch).
+// Other apps can ask for the current session and send pause, skip and end.
+enum Broadcast {
+    static let state = Notification.Name("com.braxtonhauw.studytimer.state")
+    static let request = Notification.Name("com.braxtonhauw.studytimer.request")
+    static let command = Notification.Name("com.braxtonhauw.studytimer.command")
+
+    // The whole session in a few numbers; listeners compute the countdown themselves.
+    static func info(session: Session?, pausedAt: Double?) -> [String: Any] {
+        guard let s = session else { return ["active": false] }
+        return ["active": true, "focus": s.focus, "brk": s.brk, "rounds": s.rounds,
+                "startUtc": s.startUtc, "pausedAt": pausedAt ?? 0, "code": encode(s)]
+    }
+}
+
 // ----- Background sound -----
 
 enum AmbientKind: String, CaseIterable, Identifiable {
@@ -363,6 +381,10 @@ func runTests() -> Bool {
     check("invite round trip keeps code and jam link", parsed.code == "1-p-5-4-tn2co0-3r" && parsed.link == jam)
     check("bare code still parses", parseInvite("1-p-5-4-tn2co0-3r").code == "1-p-5-4-tn2co0-3r")
     check("invite without a code finds no code", parseInvite("hey study-with-me later?").code == nil)
+    let info = Broadcast.info(session: s, pausedAt: nil)
+    check("broadcast carries the session", info["active"] as? Bool == true && info["focus"] as? Int == 25
+          && info["rounds"] as? Int == 2 && info["startUtc"] as? Double == s.startUtc)
+    check("broadcast with no session says inactive", Broadcast.info(session: nil, pausedAt: nil)["active"] as? Bool == false)
 
     // Background sound: every kind makes sound, never clips, and fades to silence.
     for kind in AmbientKind.allCases where kind != .off {
@@ -695,6 +717,24 @@ final class TimerModel: ObservableObject {
         defaults.removeObject(forKey: Key.pausedAt)
         reschedule()
         updateAmbience()
+        broadcast()
+    }
+
+    func broadcast() {
+        DistributedNotificationCenter.default().postNotificationName(
+            Broadcast.state, object: nil,
+            userInfo: Broadcast.info(session: session, pausedAt: pausedAt), deliverImmediately: true)
+    }
+
+    // Pause, skip and end from another app (Vorssaint's notch buttons).
+    func handle(command: String) {
+        guard session != nil else { return }
+        switch command {
+        case "togglePause": togglePause()
+        case "skip": skip()
+        case "end": end()
+        default: break
+        }
     }
 
     func copyCode() {
@@ -740,6 +780,7 @@ final class TimerModel: ObservableObject {
         if let p = paused { defaults.set(p, forKey: Key.pausedAt) } else { defaults.removeObject(forKey: Key.pausedAt) }
         reschedule()
         updateAmbience()
+        broadcast()
     }
 
     // Called every half second.
@@ -1804,6 +1845,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.model.reschedule() }
         }
+
+        // Other apps can ask for the session and send pause, skip and end.
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(forName: Broadcast.request, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.model.broadcast() }
+        }
+        distributed.addObserver(forName: Broadcast.command, object: nil, queue: .main) { [weak self] note in
+            let action = note.userInfo?["action"] as? String ?? ""
+            MainActor.assumeIsolated { self?.model.handle(command: action) }
+        }
+        model.broadcast()
 
         model.tick()
         updateButton()

@@ -1,0 +1,331 @@
+diff --git a/Sources/Vorssaint/Services/Notch/NotchStudyTimerBridge.swift b/Sources/Vorssaint/Services/Notch/NotchStudyTimerBridge.swift
+new file mode 100644
+index 0000000..62402bf
+--- /dev/null
++++ b/Sources/Vorssaint/Services/Notch/NotchStudyTimerBridge.swift
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Vorssaint
++
++import AppKit
++
++/// Shows a session from the Study Timer menu bar app in the island's timer
++/// strip. Study Timer broadcasts its session (start time, focus and break
++/// lengths, rounds, pause) as a distributed notification; the island mirrors
++/// the current phase as a read-only pomodoro and sends the strip's pause, skip
++/// and stop back to Study Timer. A timer started in Vorssaint always wins: a
++/// mirror never replaces it.
++final class NotchStudyTimerBridge {
++    static let shared = NotchStudyTimerBridge()
++    static let stateNotification = Notification.Name("com.braxtonhauw.studytimer.state")
++    static let requestNotification = Notification.Name("com.braxtonhauw.studytimer.request")
++    static let commandNotification = Notification.Name("com.braxtonhauw.studytimer.command")
++
++    enum Command: String { case togglePause, skip, end }
++
++    struct Session: Equatable {
++        let focus: Int        // minutes
++        let brk: Int          // minutes
++        let rounds: Int
++        let start: TimeInterval     // seconds since 1970
++        let pausedAt: TimeInterval?
++    }
++
++    struct Phase: Equatable {
++        let focus: Bool
++        let round: Int
++        let remaining: TimeInterval
++    }
++
++    struct Notice: Equatable {
++        let title: String
++        let detail: String
++        let symbol: String
++    }
++
++    private var stateObserver: NSObjectProtocol?
++    private var wakeObserver: NSObjectProtocol?
++    private var session: Session?
++    private var boundary: DispatchWorkItem?
++    /// The phase last shown, so a change can be announced like a finished agent task.
++    private var lastKey: String?
++    private init() {}
++
++    func start() {
++        guard stateObserver == nil else { return }
++        stateObserver = DistributedNotificationCenter.default().addObserver(
++            forName: Self.stateNotification, object: nil, queue: .main) { [weak self] note in
++            self?.receive(note.userInfo)
++        }
++        // Wall time and the island's clock can part ways across sleep.
++        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
++            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
++            self?.reapply()
++        }
++        // A Study Timer that is already running repeats its session.
++        DistributedNotificationCenter.default().postNotificationName(
++            Self.requestNotification, object: nil, userInfo: nil, deliverImmediately: true)
++    }
++
++    func stop() {
++        if let stateObserver { DistributedNotificationCenter.default().removeObserver(stateObserver) }
++        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
++        stateObserver = nil
++        wakeObserver = nil
++        boundary?.cancel(); boundary = nil
++        session = nil
++        lastKey = nil
++    }
++
++    func send(_ command: Command) {
++        DistributedNotificationCenter.default().postNotificationName(
++            Self.commandNotification, object: nil, userInfo: ["action": command.rawValue], deliverImmediately: true)
++    }
++
++    private func receive(_ info: [AnyHashable: Any]?) {
++        session = Self.session(from: info)
++        reapply()
++    }
++
++    /// Mirrors the current phase and waits for the next boundary.
++    func reapply() {
++        boundary?.cancel(); boundary = nil
++        let timer = NotchTimerService.shared
++        guard let session else { lastKey = nil; timer.endMirror(); return }
++        let wall = Date().timeIntervalSince1970
++        let current = Self.phase(session, at: session.pausedAt ?? wall)
++        let key = Self.key(session, phase: current, wall: wall)
++        if let notice = Self.notice(key: key, previous: lastKey, session: session, phase: current,
++                                    elapsed: wall - session.start) {
++            _ = NotchService.shared.show(NotchNotice(event: .timer, title: notice.title,
++                                                     detail: notice.detail, symbol: notice.symbol))
++            // The companion cheers a finished session, as it does a finished agent task.
++            if key == "done" { NotchService.shared.reactMascot(.celebrate) }
++        }
++        lastKey = key
++        guard let phase = current else {
++            timer.endMirror()
++            // Not started yet: come back when it starts.
++            if session.pausedAt == nil, wall < session.start { schedule(after: session.start - wall) }
++            return
++        }
++        timer.mirror(.mirrored(focus: phase.focus, minutes: phase.focus ? session.focus : session.brk,
++                               remaining: phase.remaining, paused: session.pausedAt != nil,
++                               round: phase.round, rounds: session.rounds,
++                               focusMinutes: session.focus, breakMinutes: session.brk, now: timer.now))
++        if session.pausedAt == nil { schedule(after: phase.remaining) }
++    }
++
++    private func schedule(after seconds: TimeInterval) {
++        let work = DispatchWorkItem { [weak self] in self?.reapply() }
++        boundary = work
++        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, seconds) + 0.25, execute: work)
++    }
++
++    /// The broadcast's userInfo, or nil when no session is running.
++    static func session(from info: [AnyHashable: Any]?) -> Session? {
++        guard let info, info["active"] as? Bool == true,
++              let focus = (info["focus"] as? NSNumber)?.intValue,
++              let brk = (info["brk"] as? NSNumber)?.intValue,
++              let rounds = (info["rounds"] as? NSNumber)?.intValue,
++              let start = (info["startUtc"] as? NSNumber)?.doubleValue,
++              (1...180).contains(focus), (1...60).contains(brk), (1...24).contains(rounds), start.isFinite
++        else { return nil }
++        let paused = (info["pausedAt"] as? NSNumber)?.doubleValue ?? 0
++        return Session(focus: focus, brk: brk, rounds: rounds, start: start,
++                       pausedAt: paused > 0 && paused.isFinite ? paused : nil)
++    }
++
++    /// Names a moment of the session: "waiting", "focus-2", "break-1-paused", "done".
++    static func key(_ s: Session, phase: Phase?, wall: TimeInterval) -> String {
++        guard let phase else { return wall < s.start ? "waiting" : "done" }
++        return "\(phase.focus ? "focus" : "break")-\(phase.round)" + (s.pausedAt != nil ? "-paused" : "")
++    }
++
++    /// What the island says when a Study Timer session changes. Nil keeps it
++    /// quiet: the same moment again, or a session already under way when it
++    /// was first seen (Vorssaint opening mid-session).
++    static func notice(key: String, previous: String?, session s: Session, phase: Phase?,
++                       elapsed: TimeInterval) -> Notice? {
++        guard key != previous else { return nil }
++        guard let previous else {
++            guard let phase, phase.focus, phase.round == 1, s.pausedAt == nil, elapsed < 10 else { return nil }
++            return Notice(title: "Study session started", detail: "\(s.focus) min focus · \(s.rounds) rounds",
++                          symbol: "timer")
++        }
++        if key == "done" {
++            guard previous != "waiting" else { return nil }
++            return Notice(title: "Study session complete",
++                          detail: "\(s.rounds) rounds · \(Self.minutes(s.rounds * s.focus)) focused",
++                          symbol: "checkmark.circle")
++        }
++        guard let phase else { return nil }
++        if previous == "waiting" {
++            return Notice(title: "Study session started", detail: "\(s.focus) min focus · \(s.rounds) rounds",
++                          symbol: "timer")
++        }
++        let round = "Round \(phase.round) of \(s.rounds)"
++        if key.hasSuffix("-paused") {
++            return Notice(title: "Study timer paused", detail: round, symbol: "pause.circle")
++        }
++        if previous == key + "-paused" {
++            return Notice(title: "Study timer resumed", detail: round, symbol: "play.circle")
++        }
++        return phase.focus
++            ? Notice(title: "Back to focus", detail: "\(round) · \(s.focus) min", symbol: "brain.head.profile")
++            : Notice(title: "Break time", detail: "\(round) done · \(s.brk) min break", symbol: "cup.and.saucer")
++    }
++
++    static func minutes(_ total: Int) -> String {
++        total < 60 ? "\(total) min" : total % 60 == 0 ? "\(total / 60) h" : "\(total / 60) h \(total % 60) min"
++    }
++
++    /// Study Timer's schedule: each round is focus then break, and the last
++    /// round has no break. Nil before the start and after the last focus.
++    static func phase(_ s: Session, at now: TimeInterval) -> Phase? {
++        let focus = Double(s.focus * 60)
++        let cycle = Double((s.focus + s.brk) * 60)
++        let total = Double(s.rounds) * focus + Double(s.rounds - 1) * Double(s.brk * 60)
++        let elapsed = now - s.start
++        guard elapsed.isFinite, elapsed >= 0, elapsed < total else { return nil }
++        let index = (elapsed / cycle).rounded(.down)
++        let into = elapsed - index * cycle
++        return into < focus
++            ? Phase(focus: true, round: Int(index) + 1, remaining: focus - into)
++            : Phase(focus: false, round: Int(index) + 1, remaining: cycle - into)
++    }
++}
+diff --git a/Sources/Vorssaint/Services/Notch/NotchTimerService.swift b/Sources/Vorssaint/Services/Notch/NotchTimerService.swift
+index 0e64a32..5c8393b 100644
+--- a/Sources/Vorssaint/Services/Notch/NotchTimerService.swift
++++ b/Sources/Vorssaint/Services/Notch/NotchTimerService.swift
+@@ -15,6 +15,10 @@ final class NotchTimerService: ObservableObject {
+     private var countdownTask: Task<Void, Never>?
+     private var suspended = true
+     private let alert = NotchTimerAlert()
++    /// True while `session` mirrors a Study Timer session (NotchStudyTimerBridge)
++    /// rather than a timer started here. A mirror never alerts or completes on
++    /// its own: Study Timer owns the session and sends every change.
++    private(set) var mirroring = false
+     private init() {}
+ 
+     var now: TimeInterval {
+@@ -25,6 +29,8 @@ final class NotchTimerService: ObservableObject {
+     func syncWithPreferences() {
+         guard NotchTimerSupport.isEnabled() else { stop(); return }
+         suspended = false
++        NotchStudyTimerBridge.shared.start()
++        guard !mirroring else { return }
+         finishIfDue()
+         if session.completed { alert.start(enabled: NotchTimerSupport.isSoundEnabled()) }
+         scheduleCompletion()
+@@ -32,6 +38,8 @@ final class NotchTimerService: ObservableObject {
+ 
+     func start(mode: NotchTimerMode, minutes: Int) {
+         guard !suspended, NotchTimerSupport.isEnabled() else { return }
++        // A timer started here replaces the mirror; Study Timer keeps running.
++        if mirroring { endMirror() }
+         guard !session.hasSession else { return }
+         alert.stop()
+         session.start(mode: mode, minutes: minutes, now: now, configuration: .load())
+@@ -41,6 +49,7 @@ final class NotchTimerService: ObservableObject {
+ 
+     func pauseOrResume() {
+         guard !suspended, NotchTimerSupport.isEnabled() else { return }
++        if mirroring { NotchStudyTimerBridge.shared.send(.togglePause); return }
+         finishIfDue()
+         if session.isRunning { session.pause(at: now) }
+         else if session.isPaused { session.resume(at: now) }
+@@ -49,6 +58,7 @@ final class NotchTimerService: ObservableObject {
+ 
+     func startNext() {
+         guard !suspended, NotchTimerSupport.isEnabled() else { return }
++        if mirroring { NotchStudyTimerBridge.shared.send(.skip); return }
+         guard session.canStartNext else { return }
+         alert.stop()
+         session.startNext(at: now)
+@@ -57,11 +67,14 @@ final class NotchTimerService: ObservableObject {
+     }
+ 
+     func cancel() {
++        if mirroring { NotchStudyTimerBridge.shared.send(.end); return }
+         alert.stop()
+         completionTask?.cancel(); completionTask = nil
+         countdownTask?.cancel(); countdownTask = nil
+         NotchService.shared.endMascotCountdown(retreating: false)
+         session.cancel()
++        // A Study Timer session that was waiting behind this timer shows again.
++        NotchStudyTimerBridge.shared.reapply()
+     }
+ 
+     func suspend() {
+@@ -70,11 +83,31 @@ final class NotchTimerService: ObservableObject {
+         completionTask?.cancel(); completionTask = nil
+         countdownTask?.cancel(); countdownTask = nil
+         NotchService.shared.endMascotCountdown(retreating: false)
++        NotchStudyTimerBridge.shared.stop()
++        if mirroring { mirroring = false; session.cancel() }
+     }
+ 
+     func stop() { suspend(); cancel() }
+ 
++    /// Shows a Study Timer phase in the strip, unless a timer started here is running.
++    func mirror(_ mirrored: NotchTimerSession) {
++        guard !suspended, NotchTimerSupport.isEnabled() else { return }
++        guard mirroring || !session.hasSession else { return }
++        alert.stop()
++        completionTask?.cancel(); completionTask = nil
++        countdownTask?.cancel(); countdownTask = nil
++        mirroring = true
++        session = mirrored
++    }
++
++    func endMirror() {
++        guard mirroring else { return }
++        mirroring = false
++        session.cancel()
++    }
++
+     private func finishIfDue() {
++        guard !mirroring else { return }
+         guard session.finishIfDue(at: now) else { return }
+         alert.stop()
+         // The notice takes the strip it watched from.
+@@ -91,6 +124,7 @@ final class NotchTimerService: ObservableObject {
+ 
+     private func scheduleCompletion() {
+         completionTask?.cancel(); completionTask = nil
++        guard !mirroring else { return }
+         scheduleCountdown()
+         guard !suspended, let deadline = session.deadline else { return }
+         let remaining = max(0, deadline - now)
+diff --git a/Sources/Vorssaint/Services/Notch/NotchTimerSupport.swift b/Sources/Vorssaint/Services/Notch/NotchTimerSupport.swift
+index cf5f6fc..e6b27e6 100644
+--- a/Sources/Vorssaint/Services/Notch/NotchTimerSupport.swift
++++ b/Sources/Vorssaint/Services/Notch/NotchTimerSupport.swift
+@@ -169,6 +169,25 @@ struct NotchTimerSession: Equatable {
+     }
+ 
+     mutating func cancel() { self = Self() }
++
++    /// A read-only copy of one Study Timer phase (see NotchStudyTimerBridge):
++    /// a pomodoro showing the right phase, round and time left.
++    static func mirrored(focus: Bool, minutes: Int, remaining: TimeInterval, paused: Bool,
++                         round: Int, rounds: Int, focusMinutes: Int, breakMinutes: Int,
++                         now: TimeInterval) -> Self {
++        var session = Self()
++        session.mode = .pomodoro
++        session.phase = focus ? .focus : .shortBreak
++        session.configuration = NotchPomodoroConfiguration(
++            focusMinutes: focusMinutes, shortBreakMinutes: breakMinutes, longBreakMinutes: breakMinutes,
++            longBreakInterval: rounds, totalSessions: rounds)
++        session.duration = Double(max(1, minutes)) * 60
++        // sessionNumber then reads as the round: a focus adds one for itself.
++        session.completedFocuses = max(0, round - 1) + (focus ? 0 : 1)
++        let left = max(0, min(remaining, session.duration))
++        if paused { session.pausedReading = left } else if now.isFinite { session.anchor = now + left }
++        return session
++    }
+ }
+ 
+ enum NotchTimerSupport {

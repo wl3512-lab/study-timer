@@ -2,6 +2,15 @@
 
 A study timer you can share with a friend using a short code. No accounts, no server: each device computes the same countdown from its own clock, so you both stay in sync even if one of you joins late.
 
+## Get the Mac app
+
+1. Download **StudyTimerBar.zip** from this repo's [Releases](../../releases) page and unzip it.
+2. Drag **StudyTimerBar.app** into your Applications folder and open it.
+3. macOS will say it can't check the app for malware, because it isn't signed with a paid Apple developer account. Go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+4. Allow notifications when it asks. Look for the ring in your menu bar (if your menu bar is crowded, it may be hidden behind the notch).
+
+Needs macOS 13 or later. No Mac? The web timer below uses the same share codes, so you can still study together.
+
 ## Two ways to use it
 
 **Web timer** (`study_timer.html`): set focus minutes, break minutes, rounds and a start time, click **Start**, then **Copy** the share code and send it to your partner. They paste it into **Join** on their copy of the page.
