@@ -1749,9 +1749,17 @@ struct SettingsView: View {
                         .padding(.horizontal, 12).frame(minHeight: 40)
                     }
                 }
-                .padding(.bottom, 4)
+                .padding(.bottom, 20)
             }
             .frame(height: 470)
+            // No scroll bar: macOS made room for it only while it showed, so
+            // the cards widened and narrowed as you scrolled. The fade at the
+            // bottom shows there's more.
+            .scrollIndicators(.never)
+            .mask(VStack(spacing: 0) {
+                Color.black
+                LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom).frame(height: 20)
+            })
         }
     }
 
