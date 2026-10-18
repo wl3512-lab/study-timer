@@ -1226,8 +1226,18 @@ struct RowDivider: View {
 
 // ===== Panel =====
 
+let panelWidth: CGFloat = 320
+
+struct PanelHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct PanelView: View {
     @ObservedObject var model: TimerModel
+    /// The panel's height, whenever it changes. The popover is sized from
+    /// this (never from SwiftUI's own sizing), so its width can't change.
+    var onHeight: (CGFloat) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -1246,7 +1256,14 @@ struct PanelView: View {
             }
         }
         .padding(22)
-        .frame(width: 320)
+        .frame(width: panelWidth)
+        .fixedSize(horizontal: false, vertical: true) // its own height, whatever the window's
+        .background(GeometryReader { g in
+            Color.clear.preference(key: PanelHeightKey.self, value: g.size.height)
+        })
+        .onPreferenceChange(PanelHeightKey.self) { h in onHeight(h) }
+        // Pinned to the top, so the frame the window takes to catch up never shows.
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(Aura.bg)
         .environment(\.colorScheme, Aura.t.dark ? .dark : .light)
         .tint(Aura.tint(.focus))
@@ -1841,9 +1858,11 @@ struct Footer: View {
 // ===== Menu bar =====
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var item: NSStatusItem!
     let popover = NSPopover()
+    var host: NSHostingController<PanelView>!
+    var panelHeight: CGFloat = 0
     let model = TimerModel()
     let notificationDelegate = NotificationDelegate()
 
@@ -1865,11 +1884,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(togglePopover)
         }
 
-        let host = NSHostingController(rootView: PanelView(model: model))
-        host.sizingOptions = .preferredContentSize
+        // The popover is sized by hand: always 320 wide, and as tall as the
+        // panel, changed instantly. Letting SwiftUI size it made the popover
+        // animate to whatever size the panel reported mid-update (a theme
+        // change rebuilds the whole panel), so it looked like it shrank and grew.
+        host = NSHostingController(rootView: PanelView(model: model, onHeight: { [weak self] h in
+            DispatchQueue.main.async { self?.fitPopover(height: h) }
+        }))
+        host.sizingOptions = []
         popover.contentViewController = host
+        popover.contentSize = NSSize(width: panelWidth, height: 560)
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         applyTheme()
         model.onThemeChange = { [weak self] in self?.applyTheme() }
 
@@ -1916,11 +1943,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
         } else {
             model.refreshAuthorization()
-            model.showSettings = false
+            fitPopover(height: host.view.fittingSize.height)
             NSApp.activate(ignoringOtherApps: true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    // Back to the main page while closed, so it never switches as it opens.
+    func popoverDidClose(_ notification: Notification) {
+        model.showSettings = false
+    }
+
+    func fitPopover(height: CGFloat) {
+        let h = ceil(height)
+        guard h > 0, abs(h - panelHeight) >= 1 || popover.contentSize.width != panelWidth else { return }
+        panelHeight = h
+        let animates = popover.animates
+        popover.animates = false
+        popover.contentSize = NSSize(width: panelWidth, height: h)
+        popover.animates = animates
     }
 
     func applyTheme() {
