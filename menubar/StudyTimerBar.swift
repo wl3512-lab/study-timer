@@ -1697,6 +1697,11 @@ struct SettingsView: View {
                             }
                             .labelsHidden().pickerStyle(.segmented)
                         }
+                        // Small, so "ring + time" fits: at full size its three equal
+                        // segments need 268 pt of the card's 252, and Settings flipped
+                        // between two widths as SwiftUI and AppKit disagreed on its size.
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity, alignment: .leading) // as wide as the other cards
                         .padding(12)
                     }
 
@@ -1752,9 +1757,7 @@ struct SettingsView: View {
                 .padding(.bottom, 20)
             }
             .frame(height: 470)
-            // No scroll bar: macOS made room for it only while it showed, so
-            // the cards widened and narrowed as you scrolled. The fade at the
-            // bottom shows there's more.
+            // No scroll bar: the fade at the bottom shows there's more.
             .scrollIndicators(.never)
             .mask(VStack(spacing: 0) {
                 Color.black
