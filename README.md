@@ -2,6 +2,8 @@
 
 A study timer you can share with a friend using a short code. No accounts, no server: each device computes the same countdown from its own clock, so you both stay in sync even if one of you joins late.
 
+Braxton Hauw wrote the original web timer and a first menu bar app. Lucy Liu built the Aura menu bar redesign on top of it: themes, background sounds, chimes, Spotify, presets and the Vorssaint island.
+
 ## Get the Mac app
 
 1. Download **StudyTimerBar.zip** from this repo's [Releases](../../releases) page and unzip it.

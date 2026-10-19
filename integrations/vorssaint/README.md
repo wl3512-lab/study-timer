@@ -1,6 +1,6 @@
 # Study Timer in Vorssaint's notch
 
-Puts your [Study Timer](https://github.com/bhauw/study-timer) inside [Vorssaint](https://github.com/vorssaint/vorssaint-utils)'s notch island, the way Vorssaint shows Codex and other AI agents:
+Puts your [Study Timer](https://github.com/wl3512-lab/study-timer) inside [Vorssaint](https://github.com/vorssaint/vorssaint-utils)'s notch island, the way Vorssaint shows Codex and other AI agents:
 
 - **A Study page in the island**, next to Timer, Music and Agents. It shows Study Timer's progress ring with its breathing aura, the countdown, the round dots, and pause, skip, stop and copy code. With no session running, pick a preset (or your Vorssaint pomodoro settings) to start one. If Study Timer is closed, the page has a button to open it.
 - **A live countdown beside the camera** while a session runs, in the island's timer strip.
@@ -15,7 +15,7 @@ Every button in the island sends a command to Study Timer, which owns the sessio
 
 - An Apple Silicon Mac with macOS 14 or later
 - The Xcode Command Line Tools (the install script offers to install them)
-- **Study Timer** itself, from the [Releases](https://github.com/bhauw/study-timer/releases) page, version 2.1 or later
+- **Study Timer** itself, from the [Releases](https://github.com/wl3512-lab/study-timer/releases) page, version 2.1 or later
 
 ## Install
 

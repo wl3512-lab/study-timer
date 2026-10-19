@@ -94,7 +94,7 @@ index 0000000..fa23f47
 +    func openStudyTimer() {
 +        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.studyTimerBundleID) {
 +            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
-+        } else if let url = URL(string: "https://github.com/bhauw/study-timer/releases") {
++        } else if let url = URL(string: "https://github.com/wl3512-lab/study-timer/releases") {
 +            NSWorkspace.shared.open(url)
 +        }
 +    }
