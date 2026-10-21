@@ -8,6 +8,7 @@ import SwiftUI
 import AVFoundation
 import UserNotifications
 import ServiceManagement
+import UniformTypeIdentifiers
 
 // ===== Share code logic (mirrors the web timer's pure functions) =====
 
@@ -210,6 +211,40 @@ func parseInvite(_ text: String) -> (code: String?, link: String?) {
 
 // ----- Alerts -----
 
+/// What an alert says. Words in braces, like {round}, are filled in when
+/// it's sent (see `alertTokens`).
+struct AlertText: Codable, Equatable {
+    var title: String
+    var body: String
+}
+
+/// The fill-in words, and what each becomes.
+struct AlertToken: Identifiable {
+    let token: String
+    let meaning: String
+    var id: String { token }
+}
+let alertTokens = [
+    AlertToken(token: "{round}", meaning: "this round's number"),
+    AlertToken(token: "{rounds}", meaning: "how many rounds in all"),
+    AlertToken(token: "{next}", meaning: "the next round's number"),
+    AlertToken(token: "{focus}", meaning: "focus length, like 25 min"),
+    AlertToken(token: "{break}", meaning: "break length, like 5 min"),
+    AlertToken(token: "{time}", meaning: "when this part ends, like 3:05 pm"),
+]
+
+func alertValues(_ s: Session, round: Int, ends: Double) -> [String: String] {
+    ["round": "\(round)", "rounds": "\(s.rounds)", "next": "\(min(round + 1, s.rounds))",
+     "focus": "\(s.focus) min", "break": "\(s.brk) min", "time": clockTime(ends)]
+}
+
+/// Fills in the words it knows; anything else in braces stays as typed.
+func fillAlert(_ template: String, _ values: [String: String]) -> String {
+    var out = template
+    for (key, value) in values { out = out.replacingOccurrences(of: "{\(key)}", with: value) }
+    return out.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 struct AlertEvent: Equatable {
     let kind: ChimeEvent
     let at: Double
@@ -217,34 +252,32 @@ struct AlertEvent: Equatable {
     let body: String
 }
 
-/// Every alert a session gives, in order. Only the kinds in `on` are
-/// included, and the 1-minute warnings need a phase of 3 minutes or more.
-func alertSchedule(_ s: Session, on: Set<ChimeEvent>) -> [AlertEvent] {
+/// Every alert a session gives, in order, worded from `texts` (or the
+/// defaults). Only the kinds in `on` are included, and the 1-minute
+/// warnings need a phase of 3 minutes or more.
+func alertSchedule(_ s: Session, on: Set<ChimeEvent>, texts: [ChimeEvent: AlertText] = [:]) -> [AlertEvent] {
     let f = Double(s.focus * 60), b = Double(s.brk * 60)
     var events: [AlertEvent] = []
-    func add(_ kind: ChimeEvent, _ at: Double, _ title: String, _ body: String) {
-        if on.contains(kind) { events.append(AlertEvent(kind: kind, at: at, title: title, body: body)) }
+    func add(_ kind: ChimeEvent, _ at: Double, round: Int, ends: Double) {
+        guard on.contains(kind) else { return }
+        let text = texts[kind] ?? kind.defaultText
+        let values = alertValues(s, round: round, ends: ends)
+        let title = fillAlert(text.title, values)
+        events.append(AlertEvent(kind: kind, at: at,
+                                 title: title.isEmpty ? fillAlert(kind.defaultText.title, values) : title,
+                                 body: fillAlert(text.body, values)))
     }
     for i in 0..<s.rounds {
+        let round = i + 1
         let focusStart = s.startUtc + Double(i) * (f + b)
         let focusEnd = focusStart + f
-        let last = i == s.rounds - 1
-        if i == 0 {
-            add(.focus, focusStart, "lock in", "Round 1 of \(s.rounds) · \(s.focus) min. Phone down.")
-        }
-        if s.focus >= 3 {
-            add(.focusWarning, focusEnd - 60, "1 minute left",
-                last ? "Last round of \(s.rounds). Finish strong."
-                     : "Round \(i + 1) wraps up soon, then a \(s.brk) min break.")
-        }
-        if last {
-            add(.done, focusEnd, "session complete", "All \(s.rounds) rounds done. Nice work.")
+        add(.focus, focusStart, round: round, ends: focusEnd)
+        if s.focus >= 3 { add(.focusWarning, focusEnd - 60, round: round, ends: focusEnd) }
+        if round == s.rounds {
+            add(.done, focusEnd, round: round, ends: focusEnd)
         } else {
-            add(.brk, focusEnd, "break time", "Round \(i + 1) done. Take \(s.brk) min away from the screen.")
-            if s.brk >= 3 {
-                add(.warning, focusEnd + b - 60, "1 minute left on break", "Round \(i + 2) starts soon.")
-            }
-            add(.focus, focusEnd + b, "back to focus", "Round \(i + 2) of \(s.rounds) · \(s.focus) min.")
+            add(.brk, focusEnd, round: round, ends: focusEnd + b)
+            if s.brk >= 3 { add(.warning, focusEnd + b - 60, round: round, ends: focusEnd + b) }
         }
     }
     return events
@@ -472,6 +505,15 @@ func runTests() -> Bool {
             .allSatisfy { $0.kind != .focusWarning && $0.kind != .warning })
     check("12 rounds fit in macOS's 64 pending notifications",
           alertSchedule(Session(focus: 25, brk: 5, rounds: 12, startUtc: s.startUtc), on: Set(ChimeEvent.allCases)).count <= 64)
+    check("default break alert fills in the break length",
+          all[2].title == "break time" && all[2].body == "Round 1 done. Take 5 min away from the screen.")
+    let custom = alertSchedule(s, on: [.brk], texts: [.brk: AlertText(title: "{round}/{rounds} done", body: "next {next} · {focus} · {break}")])
+    check("your own wording fills in every word", custom.first?.title == "1/2 done" && custom.first?.body == "next 2 · 25 min · 5 min")
+    let timed = alertSchedule(s, on: [.warning], texts: [.warning: AlertText(title: "t", body: "{time}")])
+    check("{time} is when the break ends", timed.first?.body == clockTime(s.startUtc + 1800))
+    check("unknown words are left as typed, and an empty title falls back to the default",
+          alertSchedule(s, on: [.done], texts: [.done: AlertText(title: " ", body: "{snack} time")]).first
+            .map { $0.title == "session complete" && $0.body == "{snack} time" } == true)
 
     // Background sound: every kind makes sound, never clips, and fades to silence.
     for kind in AmbientKind.allCases where kind != .off {
@@ -502,6 +544,7 @@ enum Key {
     static let notifications = "notificationsOn"
     static let breakWarning = "breakWarningOn" // before 2.2; read once to carry the setting over
     static let alerts = "alertsOn"
+    static let alertTexts = "alertTexts"
     static let theme = "theme"
     static let ambient = "ambient"
     static let ambientVolume = "ambientVolume"
@@ -552,16 +595,57 @@ enum ChimeEvent: String, CaseIterable, Identifiable {
         case .done: return "Hero"
         }
     }
+    var defaultText: AlertText {
+        switch self {
+        case .focus: return AlertText(title: "lock in", body: "Round {round} of {rounds} · {focus}. Phone down.")
+        case .focusWarning: return AlertText(title: "1 minute left", body: "Round {round} of {rounds} wraps up at {time}.")
+        case .brk: return AlertText(title: "break time", body: "Round {round} done. Take {break} away from the screen.")
+        case .warning: return AlertText(title: "1 minute left on break", body: "Round {next} starts at {time}.")
+        case .done: return AlertText(title: "session complete", body: "All {rounds} rounds done. Nice work.")
+        }
+    }
 }
 
 // macOS's built-in sounds, available to every app by name.
 let chimeSounds = ["none", "Glass", "Ping", "Pop", "Purr", "Tink", "Hero", "Submarine",
                    "Bottle", "Blow", "Frog", "Funk", "Morse", "Sosumi", "Basso"]
 
-func playChime(_ name: String, volume: Double) {
-    guard name != "none", let sound = NSSound(named: NSSound.Name(name))?.copy() as? NSSound else { return }
-    sound.volume = Float(volume)
-    sound.play()
+/// Plays a chime from /System/Library/Sounds like any other audio, so it
+/// follows your Mac's main volume (not the alert volume). Returns false if
+/// macOS couldn't play it.
+@discardableResult
+func playChime(_ name: String, volume: Double) -> Bool {
+    ChimePlayer.shared.play(name, volume: volume)
+}
+
+final class ChimePlayer: NSObject, AVAudioPlayerDelegate {
+    static let shared = ChimePlayer()
+    private var playing: [AVAudioPlayer] = []   // a player stops if nothing holds it
+
+    func play(_ name: String, volume: Double) -> Bool {
+        guard name != "none" else { return true }
+        let url = URL(fileURLWithPath: "/System/Library/Sounds/\(name).aiff")
+        if let player = try? AVAudioPlayer(contentsOf: url) {
+            player.volume = Float(max(0, min(1, volume)))
+            player.delegate = self
+            playing.append(player)
+            if player.play() { return true }
+            playing.removeAll { $0 === player }
+        }
+        // Not a built-in file: any sound macOS knows by this name.
+        guard let sound = NSSound(named: NSSound.Name(name)) else {
+            NSLog("Study Timer: no sound named \(name)")
+            return false
+        }
+        sound.volume = Float(volume)
+        let ok = sound.play()
+        if !ok { NSLog("Study Timer: macOS wouldn't play \(name)") }
+        return ok
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { self.playing.removeAll { $0 === player } }
+    }
 }
 
 struct Preset: Codable, Hashable, Identifiable {
@@ -677,6 +761,18 @@ final class TimerModel: ObservableObject {
     @Published var codeChanged = false          // paused/skipped since the code was last copied
     @Published var notificationsAllowed = true  // what macOS says
     @Published var showSettings = false
+    @Published var editingAlert: ChimeEvent?    // Settings → a notification's own page
+
+    // Your wording for each alert (missing = the default) and its picture.
+    @Published var alertTexts: [ChimeEvent: AlertText] = [:] {
+        didSet {
+            let raw = Dictionary(uniqueKeysWithValues: alertTexts.map { ($0.key.rawValue, $0.value) })
+            defaults.set(try? JSONEncoder().encode(raw), forKey: Key.alertTexts)
+            rescheduleSoon()
+        }
+    }
+    @Published private(set) var pictures: [ChimeEvent: NSImage] = [:]
+    var pickPicture: ((ChimeEvent) -> Void)?   // the app shows the file picker
 
     // ----- Settings (saved as they change) -----
     @Published var themeID = "aura" {
@@ -721,6 +817,13 @@ final class TimerModel: ObservableObject {
         } else if !d.bool(forKey: Key.breakWarning) {
             alerts.remove(.warning) // the old break-warning switch was off
         }
+        if let data = d.data(forKey: Key.alertTexts),
+           let raw = try? JSONDecoder().decode([String: AlertText].self, from: data) {
+            alertTexts = Dictionary(uniqueKeysWithValues: raw.compactMap { k, v in ChimeEvent(rawValue: k).map { ($0, v) } })
+        }
+        for kind in ChimeEvent.allCases {
+            if let image = NSImage(contentsOf: Self.pictureURL(kind)) { pictures[kind] = image }
+        }
         ambient = AmbientKind(rawValue: d.string(forKey: Key.ambient) ?? "") ?? .off
         ambientVolume = d.double(forKey: Key.ambientVolume)
         ambientInBreaks = d.bool(forKey: Key.ambientInBreaks)
@@ -750,8 +853,7 @@ final class TimerModel: ObservableObject {
 
     func chime(for event: ChimeEvent) -> String { chimes[event.rawValue] ?? event.defaultSound }
     func setChime(_ name: String, for event: ChimeEvent) {
-        chimes[event.rawValue] = name
-        playChime(name, volume: chimeVolume) // preview
+        chimes[event.rawValue] = name   // Settings plays it as a preview
     }
 
     // ----- Actions -----
@@ -975,6 +1077,83 @@ final class TimerModel: ObservableObject {
         if on { alerts.insert(kind) } else { alerts.remove(kind) }
     }
 
+    // ----- What notifications look like -----
+    func text(for kind: ChimeEvent) -> AlertText { alertTexts[kind] ?? kind.defaultText }
+
+    func setText(_ text: AlertText, for kind: ChimeEvent) {
+        alertTexts[kind] = text == kind.defaultText ? nil : text
+    }
+
+    func resetLook(_ kind: ChimeEvent) {
+        alertTexts[kind] = nil
+        removePicture(for: kind)
+    }
+
+    static let pictureFolder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("StudyTimerBar/Pictures", isDirectory: true)
+    static func pictureURL(_ kind: ChimeEvent) -> URL {
+        pictureFolder.appendingPathComponent("\(kind.rawValue).png")
+    }
+
+    /// Saves a small copy of the picture (so notifications stay light).
+    func setPicture(from url: URL, for kind: ChimeEvent) {
+        guard let image = NSImage(contentsOf: url), let png = pngThumbnail(image, maxSide: 400) else { return }
+        try? FileManager.default.createDirectory(at: Self.pictureFolder, withIntermediateDirectories: true)
+        guard (try? png.write(to: Self.pictureURL(kind), options: .atomic)) != nil else { return }
+        pictures[kind] = NSImage(data: png)
+        reschedule()
+    }
+
+    func removePicture(for kind: ChimeEvent) {
+        try? FileManager.default.removeItem(at: Self.pictureURL(kind))
+        if pictures.removeValue(forKey: kind) != nil { reschedule() }
+    }
+
+    // macOS moves an attachment's file into its own store, so each
+    // notification gets its own copy of the picture.
+    private func attachment(for kind: ChimeEvent) -> UNNotificationAttachment? {
+        guard pictures[kind] != nil else { return nil }
+        let copy = FileManager.default.temporaryDirectory.appendingPathComponent("studytimer-\(UUID().uuidString).png")
+        guard (try? FileManager.default.copyItem(at: Self.pictureURL(kind), to: copy)) != nil else { return nil }
+        return try? UNNotificationAttachment(identifier: kind.rawValue, url: copy,
+                                             options: [UNNotificationAttachmentOptionsTypeHintKey: UTType.png.identifier])
+    }
+
+    /// This alert as it would read now: the next one in your session, or one
+    /// from a sample 25/5 ×4 session.
+    func sampleAlert(_ kind: ChimeEvent) -> AlertEvent {
+        let t = Date().timeIntervalSince1970
+        let s = session ?? Session(focus: 25, brk: 5, rounds: 4, startUtc: t)
+        let events = alertSchedule(s, on: [kind], texts: alertTexts)
+        return events.first { $0.at > t } ?? events.first
+            ?? AlertEvent(kind: kind, at: t, title: text(for: kind).title, body: text(for: kind).body)
+    }
+
+    /// Pops up the real notification now, with its chime.
+    func sendTest(_ kind: ChimeEvent) {
+        let e = sampleAlert(kind)
+        let content = UNMutableNotificationContent()
+        content.title = e.title
+        content.body = e.body
+        if let a = attachment(for: kind) { content.attachments = [a] }
+        let request = UNNotificationRequest(identifier: "test-\(UUID().uuidString)", content: content, trigger: nil)
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            Task { @MainActor in self.notificationsAllowed = granted }
+            if granted { center.add(request) }
+        }
+        playChime(chime(for: kind), volume: chimeVolume)
+    }
+
+    // Typing a new wording reschedules once you pause, not on every key.
+    private var rescheduleWork: DispatchWorkItem?
+    private func rescheduleSoon() {
+        rescheduleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.reschedule() } }
+        rescheduleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+    }
+
     // Every alert is scheduled ahead of time, so it arrives on time even if
     // the Mac is busy. They're silent: the app plays your chosen chimes.
     func reschedule() {
@@ -983,10 +1162,11 @@ final class TimerModel: ObservableObject {
         guard notificationsOn, let s = session, pausedAt == nil else { return }
 
         let t = Date().timeIntervalSince1970
-        for (n, e) in alertSchedule(s, on: alerts).enumerated() where e.at - t > 0.5 {
+        for (n, e) in alertSchedule(s, on: alerts, texts: alertTexts).enumerated() where e.at - t > 0.5 {
             let content = UNMutableNotificationContent()
             content.title = e.title
             content.body = e.body
+            if let a = attachment(for: e.kind) { content.attachments = [a] }
             let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second],
                                                         from: Date(timeIntervalSince1970: e.at))
             let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
@@ -1015,6 +1195,25 @@ func color(_ hex: UInt32, _ alpha: Double = 1) -> Color {
 func nsColor(_ hex: UInt32, _ alpha: Double = 1) -> NSColor {
     let (r, g, b) = rgb(hex)
     return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
+}
+
+/// A PNG of `image`, scaled down so its longer side is at most `maxSide` pixels.
+func pngThumbnail(_ image: NSImage, maxSide: CGFloat) -> Data? {
+    guard let source = image.representations.first, source.pixelsWide > 0 || image.size.width > 0 else { return nil }
+    let w0 = CGFloat(source.pixelsWide > 0 ? source.pixelsWide : Int(image.size.width))
+    let h0 = CGFloat(source.pixelsHigh > 0 ? source.pixelsHigh : Int(image.size.height))
+    let scale = min(1, maxSide / max(w0, h0))
+    let w = max(1, Int((w0 * scale).rounded())), h = max(1, Int((h0 * scale).rounded()))
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8,
+                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+    rep.size = NSSize(width: w, height: h)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSGraphicsContext.current?.imageInterpolation = .high
+    image.draw(in: NSRect(x: 0, y: 0, width: w, height: h), from: .zero, operation: .copy, fraction: 1)
+    NSGraphicsContext.restoreGraphicsState()
+    return rep.representation(using: .png, properties: [:])
 }
 
 // A theme changes colors and the aura; layout and fonts stay the same.
@@ -1301,7 +1500,11 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             if model.showSettings {
-                SettingsView(model: model)
+                if let kind = model.editingAlert {
+                    AlertEditor(model: model, kind: kind)
+                } else {
+                    SettingsView(model: model)
+                }
             } else {
                 if let s = model.session {
                     RunningView(model: model, session: s)
@@ -1731,6 +1934,11 @@ struct StepRow: View {
 
 struct SettingsView: View {
     @ObservedObject var model: TimerModel
+    @State private var chimeFailed: String?   // a chime macOS wouldn't play
+
+    private func test(_ name: String) {
+        chimeFailed = playChime(name, volume: model.chimeVolume) ? nil : name
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1766,12 +1974,22 @@ struct SettingsView: View {
                         ForEach(ChimeEvent.allCases) { e in
                             RowDivider()
                             row(e.title) {
+                                Button { model.editingAlert = e } label: {
+                                    Image(systemName: "pencil")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(model.alertTexts[e] != nil || model.pictures[e] != nil ? Aura.tint(.focus) : Aura.muted)
+                                        .frame(width: 28, height: 28)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help("Change what this notification says, or add a picture")
+                                .accessibilityLabel("Customize \(e.title)")
                                 toggle(Binding(get: { model.alerts.contains(e) }, set: { model.setAlert(e, $0) }),
                                        "Alert when: \(e.title)")
                             }
                         }
                         Text(model.notificationsOn
-                             ? "Each alert pops up and plays its chime. Turn pop-ups off to keep just the chimes."
+                             ? "Each alert pops up and plays its chime. Click the pencil to change its words or add a picture."
                              : "Pop-ups are off, so the alerts you keep on only play their chimes.")
                             .font(Aura.body(11)).foregroundStyle(Aura.muted)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1782,8 +2000,18 @@ struct SettingsView: View {
                     section("chimes") {
                         ForEach(ChimeEvent.allCases) { e in
                             row(e.title) {
+                                Button { test(model.chime(for: e)) } label: {
+                                    Image(systemName: "play.fill")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(Aura.muted)
+                                        .frame(width: 24, height: 24)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help("Play this chime")
+                                .accessibilityLabel("Play the \(e.title) chime")
                                 Picker(e.title, selection: Binding(get: { model.chime(for: e) },
-                                                                   set: { model.setChime($0, for: e) })) {
+                                                                   set: { model.setChime($0, for: e); test($0) })) {
                                     ForEach(chimeSounds, id: \.self) { Text($0.lowercased()).tag($0) }
                                 }
                                 .labelsHidden().pickerStyle(.menu).fixedSize()
@@ -1792,10 +2020,17 @@ struct SettingsView: View {
                         }
                         row("volume") {
                             Slider(value: $model.chimeVolume, in: 0...1) { editing in
-                                if !editing { playChime(model.chime(for: .focus), volume: model.chimeVolume) }
+                                if !editing { test(model.chime(for: .focus)) }
                             }
                             .frame(width: 130)
                             .accessibilityLabel("Chime volume")
+                        }
+                        if let failed = chimeFailed {
+                            Text("macOS didn't play \(failed.lowercased()). Check the output and volume in System Settings → Sound.")
+                                .font(Aura.body(11)).foregroundStyle(Aura.warn)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12).padding(.bottom, 10)
                         }
                     }
 
@@ -1934,6 +2169,208 @@ struct SettingsView: View {
     }
 }
 
+// ===== A notification's own page (Settings → pencil) =====
+
+struct AlertEditor: View {
+    @ObservedObject var model: TimerModel
+    let kind: ChimeEvent
+    @State private var sent = false
+
+    var body: some View {
+        let text = model.text(for: kind)
+        let sample = model.sampleAlert(kind)
+        let picture = model.pictures[kind]
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("notification").font(Aura.display(20)).foregroundStyle(Aura.ink)
+                Spacer()
+                PillButton(title: "back") { model.editingAlert = nil }
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 8) {
+                        Text("for").font(Aura.body(13)).foregroundStyle(Aura.muted)
+                        Picker("Notification", selection: Binding(get: { kind }, set: { model.editingAlert = $0 })) {
+                            ForEach(ChimeEvent.allCases) { Text($0.title).tag($0) }
+                        }
+                        .labelsHidden().pickerStyle(.menu).fixedSize()
+                        Spacer(minLength: 0)
+                    }
+
+                    NotificationPreview(title: sample.title, message: sample.body, picture: picture)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        heading("words")
+                        Card {
+                            VStack(alignment: .leading, spacing: 10) {
+                                field("title", placeholder: kind.defaultText.title, lines: 1,
+                                      text: Binding(get: { text.title },
+                                                    set: { model.setText(AlertText(title: $0, body: model.text(for: kind).body), for: kind) }))
+                                field("message", placeholder: kind.defaultText.body, lines: 4,
+                                      text: Binding(get: { text.body },
+                                                    set: { model.setText(AlertText(title: model.text(for: kind).title, body: $0), for: kind) }))
+                                Text("click to add, it fills in when sent").font(Aura.body(11)).foregroundStyle(Aura.muted)
+                                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
+                                    ForEach(alertTokens) { t in
+                                        Button { addToken(t.token) } label: {
+                                            Text(t.token).font(Aura.mono(11)).foregroundStyle(Aura.ink)
+                                                .frame(maxWidth: .infinity).frame(height: 28)
+                                                .background(Capsule().fill(Aura.glass))
+                                                .overlay(Capsule().strokeBorder(Aura.lineStrong, lineWidth: 1))
+                                                .contentShape(Capsule())
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help(t.meaning)
+                                        .accessibilityLabel("Add \(t.token), \(t.meaning)")
+                                    }
+                                }
+                            }
+                            .padding(12)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        heading("picture")
+                        Card {
+                            HStack(spacing: 10) {
+                                Group {
+                                    if let picture {
+                                        Image(nsImage: picture).resizable().scaledToFill()
+                                    } else {
+                                        Image(systemName: "photo").font(.system(size: 15)).foregroundStyle(Aura.muted)
+                                            .frame(maxWidth: .infinity, maxHeight: .infinity).background(Aura.glass)
+                                    }
+                                }
+                                .frame(width: 40, height: 40)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Aura.line, lineWidth: 1))
+                                .accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(picture == nil ? "no picture" : "picture added").font(Aura.body(13)).foregroundStyle(Aura.ink)
+                                    Text("shows on the right").font(Aura.body(11)).foregroundStyle(Aura.muted)
+                                }
+                                Spacer(minLength: 4)
+                                PillButton(title: picture == nil ? "choose" : "change") { model.pickPicture?(kind) }
+                                    .help("Pick a picture for this notification")
+                                if picture != nil {
+                                    Button { model.removePicture(for: kind) } label: {
+                                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Aura.muted)
+                                            .frame(width: 24, height: 24).contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Remove the picture")
+                                    .accessibilityLabel("Remove the picture")
+                                }
+                            }
+                            .padding(10)
+                        }
+                    }
+
+                    let changed = model.alertTexts[kind] != nil || picture != nil
+                    HStack(spacing: 8) {
+                        InkButton(title: sent ? "sent" : "send a test", icon: sent ? "checkmark" : "bell.fill",
+                                  height: 42, glow: Aura.tint(.focus)) {
+                            model.sendTest(kind)
+                            sent = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { sent = false }
+                        }
+                        PillButton(title: "reset", height: 42) { model.resetLook(kind) }
+                            .disabled(!changed)
+                            .opacity(changed ? 1 : 0.4)
+                            .help("Back to the original words, with no picture")
+                    }
+
+                    Text(note)
+                        .font(Aura.body(11))
+                        .foregroundStyle(model.notificationsAllowed ? Aura.muted : Aura.warn)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.bottom, 20)
+            }
+            .frame(height: 470)
+            .scrollIndicators(.never)
+            .mask(VStack(spacing: 0) {
+                Color.black
+                LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom).frame(height: 20)
+            })
+        }
+    }
+
+    private var note: String {
+        if !model.notificationsAllowed {
+            return "macOS is blocking Study Timer's notifications. Turn them on in System Settings → Notifications."
+        }
+        let source = model.session == nil ? "a sample 25 / 5 ×4 session" : "your session"
+        if !model.notificationsOn { return "The preview uses \(source). Pop-ups are off in Settings, so only the test pops up." }
+        if !model.alerts.contains(kind) { return "The preview uses \(source). This alert is off in Settings, so only the test pops up." }
+        return "The preview uses \(source). To keep notifications on screen until you close them, set Study Timer to Persistent in System Settings → Notifications."
+    }
+
+    private func heading(_ title: String) -> some View {
+        Text(title.uppercased()).font(Aura.mono(10)).tracking(1).foregroundStyle(Aura.muted)
+    }
+
+    private func field(_ name: String, placeholder: String, lines: Int, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(name).font(Aura.body(11)).foregroundStyle(Aura.muted)
+            TextField(placeholder, text: text, axis: .vertical)
+                .lineLimit(1...lines)
+                .textFieldStyle(.plain)
+                .font(Aura.body(13))
+                .foregroundStyle(Aura.ink)
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Aura.glass))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Aura.lineStrong, lineWidth: 1))
+                .accessibilityLabel("Notification \(name)")
+        }
+    }
+
+    private func addToken(_ token: String) {
+        var t = model.text(for: kind)
+        t.body += (t.body.isEmpty || t.body.hasSuffix(" ") ? "" : " ") + token
+        model.setText(t, for: kind)
+    }
+}
+
+/// Roughly how macOS draws the banner: app icon, title, message, and the
+/// picture on the right.
+struct NotificationPreview: View {
+    let title: String
+    let message: String
+    let picture: NSImage?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable().interpolation(.high)
+                .frame(width: 34, height: 34)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Spacer(minLength: 0)
+                    Text("now").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Text(message).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+            }
+            if let picture {
+                Image(nsImage: picture).resizable().scaledToFill()
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        .shadow(color: .black.opacity(0.2), radius: 10, y: 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Preview: \(title). \(message)")
+    }
+}
+
 struct NotificationWarning: View {
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -2020,6 +2457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.delegate = self
         applyTheme()
         model.onThemeChange = { [weak self] in self?.applyTheme() }
+        model.pickPicture = { [weak self] kind in self?.choosePicture(for: kind) }
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
         if model.notificationsOn { model.requestAuthorization() }
@@ -2059,21 +2497,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc func togglePopover() {
-        guard let button = item.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            model.refreshAuthorization()
-            fitPopover(height: host.view.fittingSize.height)
-            NSApp.activate(ignoringOtherApps: true)
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            showPopover()
         }
     }
 
+    func showPopover() {
+        guard let button = item.button else { return }
+        model.refreshAuthorization()
+        fitPopover(height: host.view.fittingSize.height)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
     // Back to the main page while closed, so it never switches as it opens.
+    // (Not while a picture is being picked: the panel comes back where it was.)
+    private var pickingPicture = false
     func popoverDidClose(_ notification: Notification) {
+        guard !pickingPicture else { return }
         model.showSettings = false
+        model.editingAlert = nil
+    }
+
+    // The panel steps aside for the file picker, then reopens on the same page.
+    func choosePicture(for kind: ChimeEvent) {
+        pickingPicture = true
+        popover.performClose(nil)
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Choose a picture for the “\(kind.title)” notification"
+        panel.prompt = "Use Picture"
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak self] response in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if response == .OK, let url = panel.url { self.model.setPicture(from: url, for: kind) }
+                self.pickingPicture = false
+                self.showPopover()
+            }
+        }
     }
 
     func fitPopover(height: CGFloat) {
