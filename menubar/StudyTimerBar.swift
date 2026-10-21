@@ -1275,19 +1275,30 @@ func nsColor(_ hex: UInt32, _ alpha: Double = 1) -> NSColor {
     return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
 }
 
-// The 8 notification pictures that come with the app (menubar/pictures).
+// The notification pictures that come with the app (menubar/pictures).
 struct BuiltInPicture: Identifiable {
     let id: String
     let title: String
 }
 let builtInPictures = [
     BuiltInPicture(id: "aura", title: "aura ring"),
+    BuiltInPicture(id: "alien-cat", title: "alien cat"),
+    BuiltInPicture(id: "sleepy-cat", title: "sleepy cat"),
     BuiltInPicture(id: "coffee", title: "coffee"),
+    BuiltInPicture(id: "boba", title: "boba"),
     BuiltInPicture(id: "hourglass", title: "hourglass"),
+    BuiltInPicture(id: "books", title: "books"),
+    BuiltInPicture(id: "headphones", title: "headphones"),
+    BuiltInPicture(id: "rocket", title: "rocket"),
+    BuiltInPicture(id: "planet", title: "planet"),
+    BuiltInPicture(id: "ufo", title: "ufo"),
     BuiltInPicture(id: "moon", title: "moon"),
-    BuiltInPicture(id: "sprout", title: "sprout"),
     BuiltInPicture(id: "sunrise", title: "sunrise"),
+    BuiltInPicture(id: "sprout", title: "sprout"),
+    BuiltInPicture(id: "flower", title: "flower"),
+    BuiltInPicture(id: "rainbow-cloud", title: "rainbow cloud"),
     BuiltInPicture(id: "sparkle", title: "sparkle"),
+    BuiltInPicture(id: "gem", title: "gem"),
     BuiltInPicture(id: "waves", title: "waves"),
 ]
 
