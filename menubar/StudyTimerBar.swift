@@ -283,6 +283,53 @@ func alertSchedule(_ s: Session, on: Set<ChimeEvent>, texts: [ChimeEvent: AlertT
     return events
 }
 
+// ----- The setup dial -----
+// One round on a clock-like face: focus from the top, then break. A lap is
+// two hours, or four for rounds longer than that.
+
+enum DialHandle { case focus, brk }
+
+func dialLap(focus: Int, brk: Int) -> Double { focus + brk <= 120 ? 120 : 240 }
+
+/// How far round the dial a point is, clockwise from the top, 0 to 1
+/// (dx, dy from the center, with y pointing down).
+func dialFraction(dx: Double, dy: Double) -> Double {
+    let a = atan2(dx, -dy) / (2 * Double.pi)
+    return a < 0 ? a + 1 : a
+}
+
+/// Follows the pointer the short way round, so crossing the top keeps
+/// counting (0.95 → 1.05) instead of jumping a whole lap.
+func dialUnwrap(_ from: Double, to pointer: Double) -> Double {
+    var d = pointer - (from - from.rounded(.down))
+    if d > 0.5 { d -= 1 } else if d < -0.5 { d += 1 }
+    return from + d
+}
+
+/// The handle nearer the pointer (distance measured round the dial).
+func nearestDialHandle(pointer: Double, focusEnd: Double, breakEnd: Double) -> DialHandle {
+    func gap(_ a: Double, _ b: Double) -> Double {
+        let d = abs(a - b).truncatingRemainder(dividingBy: 1)
+        return min(d, 1 - d)
+    }
+    return gap(pointer, focusEnd) <= gap(pointer, breakEnd) ? .focus : .brk
+}
+
+/// Focus and break with a handle at `position` laps round: focus in 5-minute
+/// steps, break in 1-minute steps, kept in range and on the dial.
+func dialValues(_ handle: DialHandle, position: Double, focus: Int, brk: Int, lap: Double,
+                focusRange: ClosedRange<Int> = 5...180, breakRange: ClosedRange<Int> = 1...60) -> (focus: Int, brk: Int) {
+    let minutes = position * lap
+    switch handle {
+    case .focus:
+        let top = min(focusRange.upperBound, Int(lap) - brk)
+        return (min(top, max(focusRange.lowerBound, Int((minutes / 5).rounded()) * 5)), brk)
+    case .brk:
+        let top = min(breakRange.upperBound, Int(lap) - focus)
+        return (focus, min(top, max(breakRange.lowerBound, Int((minutes - Double(focus)).rounded()))))
+    }
+}
+
 // ----- Broadcast to other apps -----
 
 // Study Timer announces its session to other apps on this Mac (for example a
@@ -507,6 +554,26 @@ func runTests() -> Bool {
           alertSchedule(Session(focus: 25, brk: 5, rounds: 12, startUtc: s.startUtc), on: Set(ChimeEvent.allCases)).count <= 64)
     check("default break alert fills in the break length",
           all[2].title == "break time" && all[2].body == "Round 1 done. Take 5 min away from the screen.")
+    // The setup dial
+    check("dial: top is 0, right ¼, bottom ½, left ¾",
+          dialFraction(dx: 0, dy: -1) == 0 && abs(dialFraction(dx: 1, dy: 0) - 0.25) < 1e-9
+          && abs(dialFraction(dx: 0, dy: 1) - 0.5) < 1e-9 && abs(dialFraction(dx: -1, dy: 0) - 0.75) < 1e-9)
+    check("dial: dragging past the top keeps counting", abs(dialUnwrap(0.95, to: 0.05) - 1.05) < 1e-9
+          && abs(dialUnwrap(1.05, to: 0.9) - 0.9) < 1e-9)
+    check("dial: a quarter lap of 2 hours is 30 min focus", dialValues(.focus, position: 0.25, focus: 25, brk: 5, lap: 120) == (30, 5))
+    check("dial: focus snaps to 5 minutes", dialValues(.focus, position: 0.3, focus: 25, brk: 5, lap: 120).focus == 35)
+    check("dial: break end at 36 min after 25 focus is an 11 min break",
+          dialValues(.brk, position: 0.3, focus: 25, brk: 5, lap: 120) == (25, 11))
+    check("dial: focus stays on the dial and in range",
+          dialValues(.focus, position: 1.4, focus: 25, brk: 10, lap: 120).focus == 110
+          && dialValues(.focus, position: -0.2, focus: 25, brk: 5, lap: 120).focus == 5)
+    check("dial: break stays between 1 and 60 min",
+          dialValues(.brk, position: 0.1, focus: 25, brk: 5, lap: 120).brk == 1
+          && dialValues(.brk, position: 0.9, focus: 25, brk: 5, lap: 120).brk == 60)
+    check("dial: long rounds get a 4-hour face", dialLap(focus: 90, brk: 15) == 120 && dialLap(focus: 120, brk: 30) == 240)
+    check("dial: grabs the nearer end", nearestDialHandle(pointer: 0.21, focusEnd: 0.208, breakEnd: 0.25) == .focus
+          && nearestDialHandle(pointer: 0.3, focusEnd: 0.208, breakEnd: 0.25) == .brk)
+
     let custom = alertSchedule(s, on: [.brk], texts: [.brk: AlertText(title: "{round}/{rounds} done", body: "next {next} · {focus} · {break}")])
     check("your own wording fills in every word", custom.first?.title == "1/2 done" && custom.first?.body == "next 2 · 25 min · 5 min")
     let timed = alertSchedule(s, on: [.warning], texts: [.warning: AlertText(title: "t", body: "{time}")])
@@ -545,6 +612,7 @@ enum Key {
     static let breakWarning = "breakWarningOn" // before 2.2; read once to carry the setting over
     static let alerts = "alertsOn"
     static let alertTexts = "alertTexts"
+    static let pictureChoices = "pictureChoices"
     static let theme = "theme"
     static let ambient = "ambient"
     static let ambientVolume = "ambientVolume"
@@ -772,6 +840,14 @@ final class TimerModel: ObservableObject {
         }
     }
     @Published private(set) var pictures: [ChimeEvent: NSImage] = [:]
+    /// Which picture each alert uses: a built-in one's id, or "custom" for your own.
+    @Published private(set) var pictureChoices: [ChimeEvent: String] = [:] {
+        didSet {
+            defaults.set(Dictionary(uniqueKeysWithValues: pictureChoices.map { ($0.key.rawValue, $0.value) }),
+                         forKey: Key.pictureChoices)
+        }
+    }
+    @Published var testProblem: String?        // why the last test didn't pop up, if macOS said
     var pickPicture: ((ChimeEvent) -> Void)?   // the app shows the file picker
 
     // ----- Settings (saved as they change) -----
@@ -821,8 +897,12 @@ final class TimerModel: ObservableObject {
            let raw = try? JSONDecoder().decode([String: AlertText].self, from: data) {
             alertTexts = Dictionary(uniqueKeysWithValues: raw.compactMap { k, v in ChimeEvent(rawValue: k).map { ($0, v) } })
         }
+        let savedChoices = (d.dictionary(forKey: Key.pictureChoices) as? [String: String]) ?? [:]
         for kind in ChimeEvent.allCases {
-            if let image = NSImage(contentsOf: Self.pictureURL(kind)) { pictures[kind] = image }
+            if let image = NSImage(contentsOf: Self.pictureURL(kind)) {
+                pictures[kind] = image
+                pictureChoices[kind] = savedChoices[kind.rawValue] ?? "custom"
+            }
         }
         ambient = AmbientKind(rawValue: d.string(forKey: Key.ambient) ?? "") ?? .off
         ambientVolume = d.double(forKey: Key.ambientVolume)
@@ -1096,16 +1176,23 @@ final class TimerModel: ObservableObject {
     }
 
     /// Saves a small copy of the picture (so notifications stay light).
-    func setPicture(from url: URL, for kind: ChimeEvent) {
+    func setPicture(from url: URL, for kind: ChimeEvent, choice: String = "custom") {
         guard let image = NSImage(contentsOf: url), let png = pngThumbnail(image, maxSide: 400) else { return }
         try? FileManager.default.createDirectory(at: Self.pictureFolder, withIntermediateDirectories: true)
         guard (try? png.write(to: Self.pictureURL(kind), options: .atomic)) != nil else { return }
         pictures[kind] = NSImage(data: png)
+        pictureChoices[kind] = choice
         reschedule()
+    }
+
+    func useBuiltInPicture(_ id: String, for kind: ChimeEvent) {
+        guard let url = builtInPictureURL(id) else { return }
+        setPicture(from: url, for: kind, choice: id)
     }
 
     func removePicture(for kind: ChimeEvent) {
         try? FileManager.default.removeItem(at: Self.pictureURL(kind))
+        pictureChoices[kind] = nil
         if pictures.removeValue(forKey: kind) != nil { reschedule() }
     }
 
@@ -1138,9 +1225,15 @@ final class TimerModel: ObservableObject {
         if let a = attachment(for: kind) { content.attachments = [a] }
         let request = UNNotificationRequest(identifier: "test-\(UUID().uuidString)", content: content, trigger: nil)
         let center = UNUserNotificationCenter.current()
+        testProblem = nil
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             Task { @MainActor in self.notificationsAllowed = granted }
-            if granted { center.add(request) }
+            guard granted else { return }
+            center.add(request) { error in
+                guard let error else { return }
+                NSLog("Study Timer: test notification failed: \(error)")
+                Task { @MainActor in self.testProblem = "macOS didn't take the notification: \(error.localizedDescription)" }
+            }
         }
         playChime(chime(for: kind), volume: chimeVolume)
     }
@@ -1196,6 +1289,33 @@ func nsColor(_ hex: UInt32, _ alpha: Double = 1) -> NSColor {
     let (r, g, b) = rgb(hex)
     return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
 }
+
+// The 8 notification pictures that come with the app (menubar/pictures).
+struct BuiltInPicture: Identifiable {
+    let id: String
+    let title: String
+}
+let builtInPictures = [
+    BuiltInPicture(id: "aura", title: "aura ring"),
+    BuiltInPicture(id: "coffee", title: "coffee"),
+    BuiltInPicture(id: "hourglass", title: "hourglass"),
+    BuiltInPicture(id: "moon", title: "moon"),
+    BuiltInPicture(id: "sprout", title: "sprout"),
+    BuiltInPicture(id: "sunrise", title: "sunrise"),
+    BuiltInPicture(id: "sparkle", title: "sparkle"),
+    BuiltInPicture(id: "waves", title: "waves"),
+]
+
+func builtInPictureURL(_ id: String) -> URL? {
+    Bundle.main.url(forResource: id, withExtension: "png", subdirectory: "Pictures")
+}
+
+// Small copies for the picture menu.
+let builtInPictureIcons: [String: NSImage] = Dictionary(uniqueKeysWithValues: builtInPictures.compactMap { p in
+    guard let url = builtInPictureURL(p.id), let image = NSImage(contentsOf: url) else { return nil }
+    image.size = NSSize(width: 20, height: 20)
+    return (p.id, image)
+})
 
 /// A PNG of `image`, scaled down so its longer side is at most `maxSide` pixels.
 func pngThumbnail(_ image: NSImage, maxSide: CGFloat) -> Data? {
@@ -1385,23 +1505,119 @@ struct ProgressRing: View {
     }
 }
 
-// One round's split: focus color, then break color.
-struct SplitRing: View {
-    let focus: Int
-    let brk: Int
+/// The setup dial: one round from the top, focus (blue) then break (mint),
+/// on a two-hour face (four hours for longer rounds). Hover or click it to
+/// show a handle at the end of each; drag anywhere on it to move the nearer
+/// one, which follows your pointer round the ring.
+struct DialRing: View {
+    @Binding var focus: Int
+    @Binding var brk: Int
+    var size: CGFloat = 108
+
+    private struct Drag {
+        let handle: DialHandle
+        let lap: Double          // fixed for the whole drag, so the face doesn't rescale under you
+        let startPosition: Double
+        let startPointer: Double
+        var pointer: Double      // unwrapped, so crossing the top keeps counting
+    }
+
+    @State private var hovering = false
+    @State private var tapped = false
+    @State private var drag: Drag?
+
+    private let lineWidth: CGFloat = 7
+    private var radius: CGFloat { size / 2 - 4 - lineWidth / 2 }
 
     var body: some View {
-        let share = Double(focus) / Double(focus + brk)
-        let gap = 0.035
+        let lap = drag?.lap ?? dialLap(focus: focus, brk: brk)
+        let focusEnd = Double(focus) / lap
+        let breakEnd = min(1, Double(focus + brk) / lap)
+        let showHandles = hovering || tapped || drag != nil
+        let showingBreak = drag?.handle == .brk
         ZStack {
-            Circle()
-                .trim(from: gap / 2, to: max(gap / 2, share - gap / 2))
-                .stroke(Aura.tint(.focus), style: StrokeStyle(lineWidth: 7, lineCap: .round))
-            Circle()
-                .trim(from: min(1 - gap / 2, share + gap / 2), to: 1 - gap / 2)
-                .stroke(Aura.tint(.brk), style: StrokeStyle(lineWidth: 7, lineCap: .round))
+            Circle().stroke(Aura.line, lineWidth: lineWidth)
+                .padding(4 + lineWidth / 2)
+            arc(from: 0, to: focusEnd, tint: Aura.tint(.focus))
+            arc(from: focusEnd, to: breakEnd, tint: Aura.tint(.brk))
+            if showHandles {
+                handle(at: focusEnd, tint: Aura.tint(.focus), active: drag?.handle == .focus)
+                handle(at: breakEnd, tint: Aura.tint(.brk), active: showingBreak)
+            }
+            VStack(spacing: 0) {
+                Text("\(showingBreak ? brk : focus)").font(Aura.mono(26)).foregroundStyle(Aura.ink)
+                Text(showingBreak ? "min break" : "min focus")
+                    .font(Aura.body(11))
+                    .foregroundStyle(showingBreak ? Aura.tint(.brk) : Aura.muted)
+            }
+            .allowsHitTesting(false)
         }
-        .rotationEffect(.degrees(-90))
+        .frame(width: size, height: size)
+        .animation(.easeOut(duration: 0.15), value: showHandles)
+        .contentShape(Circle())
+        .onHover { inside in
+            hovering = inside
+            if !inside { tapped = false }
+            if drag == nil { (inside ? NSCursor.openHand : NSCursor.arrow).set() }
+        }
+        .onDisappear { if hovering { NSCursor.arrow.set() } }
+        .onTapGesture { tapped.toggle() }
+        .gesture(dragGesture)
+        .help("Drag the ends of the ring to set focus and break")
+    }
+
+    private func arc(from: Double, to: Double, tint: Color) -> some View {
+        Circle()
+            .trim(from: from, to: max(from, to))
+            .stroke(tint, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+            .rotationEffect(.degrees(-90))
+            .padding(4 + lineWidth / 2)
+    }
+
+    private func handle(at fraction: Double, tint: Color, active: Bool) -> some View {
+        let a = fraction * 2 * Double.pi
+        return Circle()
+            .fill(Color.white)
+            .overlay(Circle().strokeBorder(tint, lineWidth: 3))
+            .frame(width: active ? 18 : 15, height: active ? 18 : 15)
+            .shadow(color: tint.opacity(0.7), radius: active ? 6 : 3)
+            .position(x: size / 2 + radius * CGFloat(sin(a)), y: size / 2 - radius * CGFloat(cos(a)))
+            .transition(.scale.combined(with: .opacity))
+            .allowsHitTesting(false)
+    }
+
+    private func fraction(_ p: CGPoint) -> Double {
+        dialFraction(dx: Double(p.x - size / 2), dy: Double(p.y - size / 2))
+    }
+
+    private var dragGesture: some Gesture {
+        DragGesture(minimumDistance: 2, coordinateSpace: .local)
+            .onChanged { g in
+                var d: Drag
+                if let current = drag {
+                    d = current
+                } else {
+                    let lap = dialLap(focus: focus, brk: brk)
+                    let start = fraction(g.startLocation)
+                    let focusEnd = Double(focus) / lap, breakEnd = Double(focus + brk) / lap
+                    let h = nearestDialHandle(pointer: start, focusEnd: focusEnd, breakEnd: breakEnd)
+                    d = Drag(handle: h, lap: lap, startPosition: h == .focus ? focusEnd : breakEnd,
+                             startPointer: start, pointer: start)
+                    NSCursor.closedHand.set()
+                }
+                d.pointer = dialUnwrap(d.pointer, to: fraction(g.location))
+                drag = d
+                let v = dialValues(d.handle, position: d.startPosition + (d.pointer - d.startPointer),
+                                   focus: focus, brk: brk, lap: d.lap)
+                guard v.focus != focus || v.brk != brk else { return }
+                focus = v.focus
+                brk = v.brk
+                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            }
+            .onEnded { _ in
+                drag = nil
+                (hovering ? NSCursor.openHand : NSCursor.arrow).set()
+            }
     }
 }
 
@@ -1717,8 +1933,6 @@ struct SetupView: View {
     @AppStorage("setupRounds") private var rounds = 4
     @State private var joinText = ""
     @State private var joinError: String?
-    @State private var dragStart: (focus: Int, brk: Int)?
-    @State private var ringHover = false
     private let focusRange = 5...180
     private let breakRange = 1...60
 
@@ -1728,27 +1942,16 @@ struct SetupView: View {
         let canSave = !model.presets.contains(current) && model.presets.count < maxPresets
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 16) {
-                ZStack {
-                    SplitRing(focus: focus, brk: brk).padding(4)
-                    VStack(spacing: 0) {
-                        Text("\(focus)").font(Aura.mono(26)).foregroundStyle(Aura.ink)
-                        Text(dragStart == nil ? "min focus" : "\(brk) min break")
-                            .font(Aura.body(11))
-                            .foregroundStyle(dragStart == nil ? Aura.muted : Aura.tint(.brk))
+                DialRing(focus: $focus, brk: $brk)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("One round: \(focus) minutes focus, \(brk) minutes break")
+                    .accessibilityAdjustableAction { direction in
+                        switch direction {
+                        case .increment: focus = min(focusRange.upperBound, focus + 5)
+                        case .decrement: focus = max(focusRange.lowerBound, focus - 5)
+                        @unknown default: break
+                        }
                     }
-                }
-                .frame(width: 108, height: 108)
-                .contentShape(Circle())
-                .gesture(ringDrag)
-                .onHover { inside in
-                    guard inside != ringHover else { return }
-                    ringHover = inside
-                    if inside { NSCursor.openHand.push() } else { NSCursor.pop() }
-                }
-                .onDisappear { if ringHover { NSCursor.pop(); ringHover = false } }
-                .help("Drag sideways for focus, up or down for break")
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("One round: \(focus) minutes focus, \(brk) minutes break")
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("lock in").font(Aura.display(24)).foregroundStyle(Aura.ink)
@@ -1856,30 +2059,6 @@ struct SetupView: View {
     private func join() {
         joinError = model.join(joinText)
         if joinError == nil { joinText = "" }
-    }
-
-    // Drag the ring: sideways sets focus (5 min a step), up and down sets
-    // break (1 min a step), so one diagonal drag sets both. Each step ticks
-    // the trackpad.
-    private var ringDrag: some Gesture {
-        DragGesture(minimumDistance: 2)
-            .onChanged { g in
-                if dragStart == nil {
-                    dragStart = (focus, brk)
-                    NSCursor.closedHand.push()
-                }
-                guard let s = dragStart else { return }
-                let f = min(focusRange.upperBound, max(focusRange.lowerBound, s.focus + Int((g.translation.width / 6).rounded()) * 5))
-                let b = min(breakRange.upperBound, max(breakRange.lowerBound, s.brk - Int((g.translation.height / 5).rounded())))
-                guard f != focus || b != brk else { return }
-                focus = f
-                brk = b
-                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
-            }
-            .onEnded { _ in
-                dragStart = nil
-                NSCursor.pop()
-            }
     }
 }
 
@@ -2234,6 +2413,7 @@ struct AlertEditor: View {
                     VStack(alignment: .leading, spacing: 8) {
                         heading("picture")
                         Card {
+                          VStack(spacing: 0) {
                             HStack(spacing: 10) {
                                 Group {
                                     if let picture {
@@ -2247,24 +2427,47 @@ struct AlertEditor: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                                 .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Aura.line, lineWidth: 1))
                                 .accessibilityHidden(true)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(picture == nil ? "no picture" : "picture added").font(Aura.body(13)).foregroundStyle(Aura.ink)
-                                    Text("shows on the right").font(Aura.body(11)).foregroundStyle(Aura.muted)
-                                }
-                                Spacer(minLength: 4)
-                                PillButton(title: picture == nil ? "choose" : "change") { model.pickPicture?(kind) }
-                                    .help("Pick a picture for this notification")
-                                if picture != nil {
-                                    Button { model.removePicture(for: kind) } label: {
-                                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Aura.muted)
-                                            .frame(width: 24, height: 24).contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help("Remove the picture")
-                                    .accessibilityLabel("Remove the picture")
-                                }
+                                Text("shows on the right of the notification")
+                                    .font(Aura.body(11)).foregroundStyle(Aura.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 0)
                             }
                             .padding(10)
+                            RowDivider()
+                            HStack(spacing: 8) {
+                                Text("picture").font(Aura.body(13)).foregroundStyle(Aura.ink)
+                                Spacer(minLength: 8)
+                                Picker("Picture", selection: Binding(
+                                    get: { model.pictureChoices[kind] ?? "none" },
+                                    set: { choice in
+                                        switch choice {
+                                        case "none": model.removePicture(for: kind)
+                                        case "pick": model.pickPicture?(kind)
+                                        case "custom": break
+                                        default: model.useBuiltInPicture(choice, for: kind)
+                                        }
+                                    })) {
+                                    Text("no picture").tag("none")
+                                    Divider()
+                                    ForEach(builtInPictures) { p in
+                                        if let icon = builtInPictureIcons[p.id] {
+                                            Label { Text(p.title) } icon: { Image(nsImage: icon) }.tag(p.id)
+                                        } else {
+                                            Text(p.title).tag(p.id)
+                                        }
+                                    }
+                                    Divider()
+                                    if model.pictureChoices[kind] == "custom" {
+                                        Text("your picture").tag("custom")
+                                    }
+                                    Text("choose your own…").tag("pick")
+                                }
+                                .labelsHidden().pickerStyle(.menu).fixedSize()
+                                .help("Pick a picture for this notification")
+                            }
+                            .padding(.leading, 12).padding(.trailing, 8).padding(.vertical, 6)
+                            .frame(minHeight: 40)
+                          }
                         }
                     }
 
@@ -2302,10 +2505,13 @@ struct AlertEditor: View {
         if !model.notificationsAllowed {
             return "macOS is blocking Study Timer's notifications. Turn them on in System Settings → Notifications."
         }
+        if let problem = model.testProblem { return problem }
         let source = model.session == nil ? "a sample 25 / 5 ×4 session" : "your session"
-        if !model.notificationsOn { return "The preview uses \(source). Pop-ups are off in Settings, so only the test pops up." }
-        if !model.alerts.contains(kind) { return "The preview uses \(source). This alert is off in Settings, so only the test pops up." }
-        return "The preview uses \(source). To keep notifications on screen until you close them, set Study Timer to Persistent in System Settings → Notifications."
+        var lines = ["The preview uses \(source)."]
+        if !model.notificationsOn { lines.append("Pop-ups are off in Settings, so only the test pops up.") }
+        else if !model.alerts.contains(kind) { lines.append("This alert is off in Settings, so only the test pops up.") }
+        lines.append("Hear the chime but see no pop-up? A Focus (like Do Not Disturb) is hiding it: allow Study Timer in System Settings → Focus.")
+        return lines.joined(separator: " ")
     }
 
     private func heading(_ title: String) -> some View {

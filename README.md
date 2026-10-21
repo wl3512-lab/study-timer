@@ -20,7 +20,7 @@ Live version: https://claude.ai/artifact/JnMKumzc6V92D4AHpx1K9L
 
 **Mac menu bar app** (`menubar/`): a small ring in the menu bar fills up as the current phase runs, with the countdown beside it. Click it to open the panel:
 
-- **Start a session** from a preset (25/5, 50/10, 90/15) or set focus, break and rounds yourself. The ring at the top shows one round's focus and break split.
+- **Start a session** from a preset (25/5, 50/10, 90/15) or set focus, break and rounds yourself. The dial at the top shows one round on a two-hour face (four hours for longer rounds): focus in blue from the top, then break in mint. Hover over it or click it and a handle appears at the end of each; drag anywhere on the ring to move the nearer one.
 - **While it runs**: a progress ring around the countdown, one dot per round, and a soft aura that breathes behind it. The aura is locked to the session clock (one breath every 6 seconds, quickening to every 2 seconds in the last minute of a phase), so two people on the same code see it breathe in sync.
 - **Colors**: in the default Aura theme, light blue for focus, mint for break, lavender while waiting to start, gold when done.
 - **Themes** (Settings → Theme): **Aura** (night sky), **Cloud** (light, for daytime), **Mochi** (soft pastels), **Mono** (black and white, menu bar icon matches your menu bar), and **Prism** (an iridescent ring, with an aura whose hue drifts once a minute on the session clock). Themes change colors and the aura; layout and fonts stay the same.
@@ -33,7 +33,7 @@ Live version: https://claude.ai/artifact/JnMKumzc6V92D4AHpx1K9L
   - **Theme**: the five themes below.
   - **Background sound**: white, pink or brown noise, rain, or ocean, made live by the app so it loops with no seams. It fades in during focus and out on breaks (or keeps going, if you turn on "also during breaks"), with its own volume.
   - **Notifications**: turn pop-ups on or off, and turn each alert on or off: focus starts, 1 min before break, break starts, 1 min before break ends, session done. An alert that's off plays no chime either; with pop-ups off, the alerts you keep on still chime.
-    Click the pencil next to an alert to make it your own: change its title and message (with fill-in words: {round}, {rounds}, {next}, {focus}, {break}, and {time} for when that part ends), add a picture that shows on the right of the notification, see a live preview, and send a test.
+    Click the pencil next to an alert to make it your own: change its title and message (with fill-in words: {round}, {rounds}, {next}, {focus}, {break}, and {time} for when that part ends), pick a picture that shows on the right of the notification (8 come with the app: aura ring, coffee, hourglass, moon, sprout, sunrise, sparkle, waves, or choose your own), see a live preview, and send a test.
   - **Chimes**: pick a macOS sound (or none) for each alert, plus chime volume. ▶ plays one. Chimes follow your Mac's main volume, not the alert volume.
   - **Menu bar**: show ring + time, ring only, or time only, as 18:42 or 19m.
   - **Spotify**: open Spotify when a session starts, play a playlist or album you paste a link to, and pause the music on breaks. The first time, macOS asks to let Study Timer control Spotify.
