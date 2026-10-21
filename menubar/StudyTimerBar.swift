@@ -2403,12 +2403,7 @@ struct Footer: View {
             .accessibilityLabel("Settings")
             .keyboardShortcut(",")
 
-            Spacer()
-            Button("quit") { NSApp.terminate(nil) }
-                .buttonStyle(.plain)
-                .font(Aura.body(12))
-                .foregroundStyle(Aura.muted)
-                .keyboardShortcut("q")
+            Spacer() // quit lives in Settings → General
         }
     }
 }
