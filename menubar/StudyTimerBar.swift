@@ -285,9 +285,8 @@ func alertSchedule(_ s: Session, on: Set<ChimeEvent>, texts: [ChimeEvent: AlertT
 
 // ----- The setup dial -----
 // One round on a clock-like face: focus from the top, then break. A lap is
-// two hours, or four for rounds longer than that.
-
-enum DialHandle { case focus, brk }
+// two hours, or four for rounds longer than that. One handle at the end of
+// the round stretches it: focus and break grow and shrink together.
 
 func dialLap(focus: Int, brk: Int) -> Double { focus + brk <= 120 ? 120 : 240 }
 
@@ -306,28 +305,19 @@ func dialUnwrap(_ from: Double, to pointer: Double) -> Double {
     return from + d
 }
 
-/// The handle nearer the pointer (distance measured round the dial).
-func nearestDialHandle(pointer: Double, focusEnd: Double, breakEnd: Double) -> DialHandle {
-    func gap(_ a: Double, _ b: Double) -> Double {
-        let d = abs(a - b).truncatingRemainder(dividingBy: 1)
-        return min(d, 1 - d)
-    }
-    return gap(pointer, focusEnd) <= gap(pointer, breakEnd) ? .focus : .brk
-}
-
-/// Focus and break with a handle at `position` laps round: focus in 5-minute
-/// steps, break in 1-minute steps, kept in range and on the dial.
-func dialValues(_ handle: DialHandle, position: Double, focus: Int, brk: Int, lap: Double,
+/// Focus and break with the round's end at `position` laps round. Focus moves
+/// in 5-minute steps and break keeps the share of focus it had (`ratio` is
+/// break ÷ focus when the drag began), so a longer focus gets a longer break.
+/// Both stay in range, and the round stays on the face.
+func dialValues(position: Double, lap: Double, ratio: Double,
                 focusRange: ClosedRange<Int> = 5...180, breakRange: ClosedRange<Int> = 1...60) -> (focus: Int, brk: Int) {
-    let minutes = position * lap
-    switch handle {
-    case .focus:
-        let top = min(focusRange.upperBound, Int(lap) - brk)
-        return (min(top, max(focusRange.lowerBound, Int((minutes / 5).rounded()) * 5)), brk)
-    case .brk:
-        let top = min(breakRange.upperBound, Int(lap) - focus)
-        return (focus, min(top, max(breakRange.lowerBound, Int((minutes - Double(focus)).rounded()))))
+    func breakFor(_ f: Int) -> Int {
+        min(breakRange.upperBound, max(breakRange.lowerBound, Int((Double(f) * ratio).rounded())))
     }
+    let total = max(0, position) * lap
+    var focus = min(focusRange.upperBound, max(focusRange.lowerBound, Int((total / (1 + ratio) / 5).rounded()) * 5))
+    while focus > focusRange.lowerBound && Double(focus + breakFor(focus)) > lap { focus -= 5 }
+    return (focus, breakFor(focus))
 }
 
 // ----- Broadcast to other apps -----
@@ -560,19 +550,14 @@ func runTests() -> Bool {
           && abs(dialFraction(dx: 0, dy: 1) - 0.5) < 1e-9 && abs(dialFraction(dx: -1, dy: 0) - 0.75) < 1e-9)
     check("dial: dragging past the top keeps counting", abs(dialUnwrap(0.95, to: 0.05) - 1.05) < 1e-9
           && abs(dialUnwrap(1.05, to: 0.9) - 0.9) < 1e-9)
-    check("dial: a quarter lap of 2 hours is 30 min focus", dialValues(.focus, position: 0.25, focus: 25, brk: 5, lap: 120) == (30, 5))
-    check("dial: focus snaps to 5 minutes", dialValues(.focus, position: 0.3, focus: 25, brk: 5, lap: 120).focus == 35)
-    check("dial: break end at 36 min after 25 focus is an 11 min break",
-          dialValues(.brk, position: 0.3, focus: 25, brk: 5, lap: 120) == (25, 11))
-    check("dial: focus stays on the dial and in range",
-          dialValues(.focus, position: 1.4, focus: 25, brk: 10, lap: 120).focus == 110
-          && dialValues(.focus, position: -0.2, focus: 25, brk: 5, lap: 120).focus == 5)
-    check("dial: break stays between 1 and 60 min",
-          dialValues(.brk, position: 0.1, focus: 25, brk: 5, lap: 120).brk == 1
-          && dialValues(.brk, position: 0.9, focus: 25, brk: 5, lap: 120).brk == 60)
+    check("dial: a quarter of 2 hours at 25/5 is still 25/5", dialValues(position: 0.25, lap: 120, ratio: 0.2) == (25, 5))
+    check("dial: longer focus gets a longer break: 50/10 at half a lap, 75/15 at ¾",
+          dialValues(position: 0.5, lap: 120, ratio: 0.2) == (50, 10) && dialValues(position: 0.75, lap: 120, ratio: 0.2) == (75, 15))
+    check("dial: your own ratio is kept (25/2 grows to 55/4)", dialValues(position: 0.5, lap: 120, ratio: 2.0 / 25) == (55, 4))
+    check("dial: never below 5/1", dialValues(position: -0.2, lap: 120, ratio: 0.2) == (5, 1))
+    check("dial: the round stays on the 2-hour face", dialValues(position: 1.3, lap: 120, ratio: 0.2) == (100, 20))
+    check("dial: up to 180 min focus on the 4-hour face", dialValues(position: 0.95, lap: 240, ratio: 0.2) == (180, 36))
     check("dial: long rounds get a 4-hour face", dialLap(focus: 90, brk: 15) == 120 && dialLap(focus: 120, brk: 30) == 240)
-    check("dial: grabs the nearer end", nearestDialHandle(pointer: 0.21, focusEnd: 0.208, breakEnd: 0.25) == .focus
-          && nearestDialHandle(pointer: 0.3, focusEnd: 0.208, breakEnd: 0.25) == .brk)
 
     let custom = alertSchedule(s, on: [.brk], texts: [.brk: AlertText(title: "{round}/{rounds} done", body: "next {next} · {focus} · {break}")])
     check("your own wording fills in every word", custom.first?.title == "1/2 done" && custom.first?.body == "next 2 · 25 min · 5 min")
@@ -1507,18 +1492,18 @@ struct ProgressRing: View {
 
 /// The setup dial: one round from the top, focus (blue) then break (mint),
 /// on a two-hour face (four hours for longer rounds). Hover or click it to
-/// show a handle at the end of each; drag anywhere on it to move the nearer
-/// one, which follows your pointer round the ring.
+/// show the handle at the end of the round; drag anywhere on the ring to
+/// stretch the round, and focus and break grow and shrink together.
 struct DialRing: View {
     @Binding var focus: Int
     @Binding var brk: Int
     var size: CGFloat = 108
 
     private struct Drag {
-        let handle: DialHandle
-        let lap: Double          // fixed for the whole drag, so the face doesn't rescale under you
-        let startPosition: Double
-        let startPointer: Double
+        var lap: Double          // only grows mid-drag (2 h → 4 h past the top)
+        let ratio: Double        // break ÷ focus when the drag began
+        var startPosition: Double
+        var startPointer: Double
         var pointer: Double      // unwrapped, so crossing the top keeps counting
     }
 
@@ -1532,28 +1517,25 @@ struct DialRing: View {
     var body: some View {
         let lap = drag?.lap ?? dialLap(focus: focus, brk: brk)
         let focusEnd = Double(focus) / lap
-        let breakEnd = min(1, Double(focus + brk) / lap)
-        let showHandles = hovering || tapped || drag != nil
-        let showingBreak = drag?.handle == .brk
+        let roundEnd = min(1, Double(focus + brk) / lap)
+        let showHandle = hovering || tapped || drag != nil
         ZStack {
             Circle().stroke(Aura.line, lineWidth: lineWidth)
                 .padding(4 + lineWidth / 2)
             arc(from: 0, to: focusEnd, tint: Aura.tint(.focus))
-            arc(from: focusEnd, to: breakEnd, tint: Aura.tint(.brk))
-            if showHandles {
-                handle(at: focusEnd, tint: Aura.tint(.focus), active: drag?.handle == .focus)
-                handle(at: breakEnd, tint: Aura.tint(.brk), active: showingBreak)
+            arc(from: focusEnd, to: roundEnd, tint: Aura.tint(.brk))
+            if showHandle {
+                handle(at: roundEnd, active: drag != nil)
             }
-            VStack(spacing: 0) {
-                Text("\(showingBreak ? brk : focus)").font(Aura.mono(26)).foregroundStyle(Aura.ink)
-                Text(showingBreak ? "min break" : "min focus")
-                    .font(Aura.body(11))
-                    .foregroundStyle(showingBreak ? Aura.tint(.brk) : Aura.muted)
+            VStack(spacing: 1) {
+                Text("\(focus)").font(Aura.mono(26)).foregroundStyle(Aura.ink)
+                Text("min focus").font(Aura.body(11)).foregroundStyle(Aura.muted)
+                Text("+\(brk) break").font(Aura.body(11, .medium)).foregroundStyle(Aura.tint(.brk))
             }
             .allowsHitTesting(false)
         }
         .frame(width: size, height: size)
-        .animation(.easeOut(duration: 0.15), value: showHandles)
+        .animation(.easeOut(duration: 0.15), value: showHandle)
         .contentShape(Circle())
         .onHover { inside in
             hovering = inside
@@ -1563,7 +1545,7 @@ struct DialRing: View {
         .onDisappear { if hovering { NSCursor.arrow.set() } }
         .onTapGesture { tapped.toggle() }
         .gesture(dragGesture)
-        .help("Drag the ends of the ring to set focus and break")
+        .help("Drag round the ring: a longer focus gets a longer break")
     }
 
     private func arc(from: Double, to: Double, tint: Color) -> some View {
@@ -1574,8 +1556,9 @@ struct DialRing: View {
             .padding(4 + lineWidth / 2)
     }
 
-    private func handle(at fraction: Double, tint: Color, active: Bool) -> some View {
+    private func handle(at fraction: Double, active: Bool) -> some View {
         let a = fraction * 2 * Double.pi
+        let tint = Aura.tint(.brk)
         return Circle()
             .fill(Color.white)
             .overlay(Circle().strokeBorder(tint, lineWidth: 3))
@@ -1599,16 +1582,19 @@ struct DialRing: View {
                 } else {
                     let lap = dialLap(focus: focus, brk: brk)
                     let start = fraction(g.startLocation)
-                    let focusEnd = Double(focus) / lap, breakEnd = Double(focus + brk) / lap
-                    let h = nearestDialHandle(pointer: start, focusEnd: focusEnd, breakEnd: breakEnd)
-                    d = Drag(handle: h, lap: lap, startPosition: h == .focus ? focusEnd : breakEnd,
-                             startPointer: start, pointer: start)
+                    d = Drag(lap: lap, ratio: Double(brk) / Double(max(1, focus)),
+                             startPosition: Double(focus + brk) / lap, startPointer: start, pointer: start)
                     NSCursor.closedHand.set()
                 }
                 d.pointer = dialUnwrap(d.pointer, to: fraction(g.location))
+                // Past the top of the 2-hour face, switch to 4 hours and carry on from here.
+                if d.lap < 240 && d.startPosition + (d.pointer - d.startPointer) > 1.02 {
+                    d.startPosition = Double(focus + brk) / 240
+                    d.startPointer = d.pointer
+                    d.lap = 240
+                }
                 drag = d
-                let v = dialValues(d.handle, position: d.startPosition + (d.pointer - d.startPointer),
-                                   focus: focus, brk: brk, lap: d.lap)
+                let v = dialValues(position: d.startPosition + (d.pointer - d.startPointer), lap: d.lap, ratio: d.ratio)
                 guard v.focus != focus || v.brk != brk else { return }
                 focus = v.focus
                 brk = v.brk
