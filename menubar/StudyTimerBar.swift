@@ -208,6 +208,48 @@ func parseInvite(_ text: String) -> (code: String?, link: String?) {
     return (code, link)
 }
 
+// ----- Alerts -----
+
+struct AlertEvent: Equatable {
+    let kind: ChimeEvent
+    let at: Double
+    let title: String
+    let body: String
+}
+
+/// Every alert a session gives, in order. Only the kinds in `on` are
+/// included, and the 1-minute warnings need a phase of 3 minutes or more.
+func alertSchedule(_ s: Session, on: Set<ChimeEvent>) -> [AlertEvent] {
+    let f = Double(s.focus * 60), b = Double(s.brk * 60)
+    var events: [AlertEvent] = []
+    func add(_ kind: ChimeEvent, _ at: Double, _ title: String, _ body: String) {
+        if on.contains(kind) { events.append(AlertEvent(kind: kind, at: at, title: title, body: body)) }
+    }
+    for i in 0..<s.rounds {
+        let focusStart = s.startUtc + Double(i) * (f + b)
+        let focusEnd = focusStart + f
+        let last = i == s.rounds - 1
+        if i == 0 {
+            add(.focus, focusStart, "lock in", "Round 1 of \(s.rounds) · \(s.focus) min. Phone down.")
+        }
+        if s.focus >= 3 {
+            add(.focusWarning, focusEnd - 60, "1 minute left",
+                last ? "Last round of \(s.rounds). Finish strong."
+                     : "Round \(i + 1) wraps up soon, then a \(s.brk) min break.")
+        }
+        if last {
+            add(.done, focusEnd, "session complete", "All \(s.rounds) rounds done. Nice work.")
+        } else {
+            add(.brk, focusEnd, "break time", "Round \(i + 1) done. Take \(s.brk) min away from the screen.")
+            if s.brk >= 3 {
+                add(.warning, focusEnd + b - 60, "1 minute left on break", "Round \(i + 2) starts soon.")
+            }
+            add(.focus, focusEnd + b, "back to focus", "Round \(i + 2) of \(s.rounds) · \(s.focus) min.")
+        }
+    }
+    return events
+}
+
 // ----- Broadcast to other apps -----
 
 // Study Timer announces its session to other apps on this Mac (for example a
@@ -417,6 +459,20 @@ func runTests() -> Bool {
           Broadcast.command(from: ["action": "togglePause"]) == .togglePause && Broadcast.command(from: ["action": "skip"]) == .skip
           && Broadcast.command(from: ["action": "end"]) == .end && Broadcast.command(from: ["action": "launch-rockets"]) == .unknown)
 
+    // Alerts for 25/5/2: lock in, 1 min before break, break, 1 min before
+    // break ends, back to focus, 1 min left, done.
+    let all = alertSchedule(s, on: Set(ChimeEvent.allCases))
+    check("25/5/2 gives 7 alerts in order", all.map(\.kind) == [.focus, .focusWarning, .brk, .warning, .focus, .focusWarning, .done])
+    check("1 min before break comes at 24:00", all[1].at == s.startUtc + 1440)
+    check("1 min before break ends comes at 29:00", all[3].at == s.startUtc + 1740)
+    check("alerts you turn off are left out",
+          alertSchedule(s, on: [.brk, .done]).map(\.kind) == [.brk, .done])
+    check("no 1-minute warnings for 2-minute phases",
+          alertSchedule(Session(focus: 2, brk: 2, rounds: 2, startUtc: s.startUtc), on: Set(ChimeEvent.allCases))
+            .allSatisfy { $0.kind != .focusWarning && $0.kind != .warning })
+    check("12 rounds fit in macOS's 64 pending notifications",
+          alertSchedule(Session(focus: 25, brk: 5, rounds: 12, startUtc: s.startUtc), on: Set(ChimeEvent.allCases)).count <= 64)
+
     // Background sound: every kind makes sound, never clips, and fades to silence.
     for kind in AmbientKind.allCases where kind != .off {
         let g = NoiseGenerator(sampleRate: 44100)
@@ -444,7 +500,8 @@ enum Key {
     static let pausedAt = "pausedAt"
     static let jam = "jamLink"
     static let notifications = "notificationsOn"
-    static let breakWarning = "breakWarningOn"
+    static let breakWarning = "breakWarningOn" // before 2.2; read once to carry the setting over
+    static let alerts = "alertsOn"
     static let theme = "theme"
     static let ambient = "ambient"
     static let ambientVolume = "ambientVolume"
@@ -471,20 +528,25 @@ enum BarStyle: String, CaseIterable, Identifiable {
     }
 }
 
+// The moments Study Timer tells you about. Each can be turned off, and each
+// has its own chime. (`warning` is the 1 minute before a break ends; the
+// raw values are what saved chime choices use, so they stay as they are.)
 enum ChimeEvent: String, CaseIterable, Identifiable {
-    case focus, brk, warning, done
+    case focus, focusWarning, brk, warning, done
     var id: String { rawValue }
     var title: String {
         switch self {
         case .focus: return "focus starts"
+        case .focusWarning: return "1 min before break"
         case .brk: return "break starts"
-        case .warning: return "1 min left on break"
+        case .warning: return "1 min before break ends"
         case .done: return "session done"
         }
     }
     var defaultSound: String {
         switch self {
         case .focus: return "Glass"
+        case .focusWarning: return "Tink"
         case .brk: return "Submarine"
         case .warning: return "Tink"
         case .done: return "Hero"
@@ -625,7 +687,10 @@ final class TimerModel: ObservableObject {
         }
     }
     @Published var notificationsOn = true { didSet { defaults.set(notificationsOn, forKey: Key.notifications); if notificationsOn { requestAuthorization() }; reschedule() } }
-    @Published var breakWarningOn = true { didSet { defaults.set(breakWarningOn, forKey: Key.breakWarning); reschedule() } }
+    /// Which moments alert you (a pop-up if notifications are on, plus its chime).
+    @Published var alerts: Set<ChimeEvent> = Set(ChimeEvent.allCases) {
+        didSet { defaults.set(alerts.map(\.rawValue).sorted(), forKey: Key.alerts); reschedule() }
+    }
     @Published var ambient: AmbientKind = .off { didSet { defaults.set(ambient.rawValue, forKey: Key.ambient); updateAmbience() } }
     @Published var ambientVolume = 0.5 { didSet { defaults.set(ambientVolume, forKey: Key.ambientVolume); updateAmbience() } }
     @Published var ambientInBreaks = false { didSet { defaults.set(ambientInBreaks, forKey: Key.ambientInBreaks); updateAmbience() } }
@@ -643,7 +708,7 @@ final class TimerModel: ObservableObject {
 
     var onThemeChange: (() -> Void)?   // also redraws the menu bar
     private var lastPhaseKey: String?
-    private var warnArmedRound: Int?
+    private var warnArmed: String?  // the phase whose 1-minute chime is still to come
 
     init() {
         let d = UserDefaults.standard
@@ -651,7 +716,11 @@ final class TimerModel: ObservableObject {
         themeID = d.string(forKey: Key.theme) ?? "aura"
         currentTheme = themes.first { $0.id == themeID } ?? themes[0]
         notificationsOn = d.bool(forKey: Key.notifications)
-        breakWarningOn = d.bool(forKey: Key.breakWarning)
+        if let saved = d.stringArray(forKey: Key.alerts) {
+            alerts = Set(saved.compactMap(ChimeEvent.init(rawValue:)))
+        } else if !d.bool(forKey: Key.breakWarning) {
+            alerts.remove(.warning) // the old break-warning switch was off
+        }
         ambient = AmbientKind(rawValue: d.string(forKey: Key.ambient) ?? "") ?? .off
         ambientVolume = d.double(forKey: Key.ambientVolume)
         ambientInBreaks = d.bool(forKey: Key.ambientInBreaks)
@@ -817,7 +886,7 @@ final class TimerModel: ObservableObject {
         session = s
         pausedAt = paused
         lastPhaseKey = nil
-        warnArmedRound = nil
+        warnArmed = nil
         defaults.set(encode(s), forKey: Key.code)
         if let p = paused { defaults.set(p, forKey: Key.pausedAt) } else { defaults.removeObject(forKey: Key.pausedAt) }
         reschedule()
@@ -838,13 +907,13 @@ final class TimerModel: ObservableObject {
         if let last = lastPhaseKey, last != key {
             switch p.state {
             case .focus:
-                playChime(chime(for: .focus), volume: chimeVolume)
+                if alerts.contains(.focus) { playChime(chime(for: .focus), volume: chimeVolume) }
                 if spotifyPauseOnBreak { Spotify.play() }
             case .brk:
-                playChime(chime(for: .brk), volume: chimeVolume)
+                if alerts.contains(.brk) { playChime(chime(for: .brk), volume: chimeVolume) }
                 if spotifyPauseOnBreak { Spotify.pause() }
             case .finished:
-                playChime(chime(for: .done), volume: chimeVolume)
+                if alerts.contains(.done) { playChime(chime(for: .done), volume: chimeVolume) }
                 if spotifyPauseOnBreak { Spotify.pause() }
             case .notStarted:
                 break
@@ -852,13 +921,18 @@ final class TimerModel: ObservableObject {
         }
         lastPhaseKey = key
 
-        // 1-minute warning, only if we saw this break with more than a minute left.
-        if p.state == .brk && breakWarningOn && s.brk >= 3 && !isPaused {
-            if p.remaining > 60 {
-                warnArmedRound = p.round
-            } else if warnArmedRound == p.round {
-                playChime(chime(for: .warning), volume: chimeVolume)
-                warnArmedRound = nil
+        // 1-minute warnings (before a break, and before a break ends), only
+        // if we saw this phase with more than a minute left.
+        if !isPaused, p.state == .focus || p.state == .brk {
+            let kind: ChimeEvent = p.state == .focus ? .focusWarning : .warning
+            let length = p.state == .focus ? s.focus : s.brk
+            if alerts.contains(kind) && length >= 3 {
+                if p.remaining > 60 {
+                    warnArmed = key
+                } else if warnArmed == key {
+                    playChime(chime(for: kind), volume: chimeVolume)
+                    warnArmed = nil
+                }
             }
         }
     }
@@ -897,34 +971,19 @@ final class TimerModel: ObservableObject {
         }
     }
 
-    // Every phase change is scheduled ahead of time, so alerts arrive on time
-    // even if the Mac is busy. They're silent: the app plays your chosen chimes.
+    func setAlert(_ kind: ChimeEvent, _ on: Bool) {
+        if on { alerts.insert(kind) } else { alerts.remove(kind) }
+    }
+
+    // Every alert is scheduled ahead of time, so it arrives on time even if
+    // the Mac is busy. They're silent: the app plays your chosen chimes.
     func reschedule() {
         let center = UNUserNotificationCenter.current()
         center.removeAllPendingNotificationRequests()
         guard notificationsOn, let s = session, pausedAt == nil else { return }
 
-        let f = Double(s.focus * 60), b = Double(s.brk * 60)
-        var events: [(at: Double, title: String, body: String)] = []
-        for i in 0..<s.rounds {
-            let focusStart = s.startUtc + Double(i) * (f + b)
-            let focusEnd = focusStart + f
-            if i == 0 {
-                events.append((focusStart, "lock in", "Round 1 of \(s.rounds) · \(s.focus) min. Phone down."))
-            }
-            if i == s.rounds - 1 {
-                events.append((focusEnd, "session complete", "All \(s.rounds) rounds done. Nice work."))
-            } else {
-                events.append((focusEnd, "break time", "Round \(i + 1) done. Take \(s.brk) min away from the screen."))
-                if breakWarningOn && s.brk >= 3 {
-                    events.append((focusEnd + b - 60, "1 minute left on break", "Round \(i + 2) starts soon."))
-                }
-                events.append((focusEnd + b, "back to focus", "Round \(i + 2) of \(s.rounds) · \(s.focus) min."))
-            }
-        }
-
         let t = Date().timeIntervalSince1970
-        for (n, e) in events.enumerated() where e.at - t > 0.5 {
+        for (n, e) in alertSchedule(s, on: alerts).enumerated() where e.at - t > 0.5 {
             let content = UNMutableNotificationContent()
             content.title = e.title
             content.body = e.body
@@ -1455,6 +1514,10 @@ struct SetupView: View {
     @AppStorage("setupRounds") private var rounds = 4
     @State private var joinText = ""
     @State private var joinError: String?
+    @State private var dragStart: (focus: Int, brk: Int)?
+    @State private var ringHover = false
+    private let focusRange = 5...180
+    private let breakRange = 1...60
 
     var body: some View {
         let preview = Session(focus: focus, brk: brk, rounds: rounds, startUtc: model.now)
@@ -1466,10 +1529,21 @@ struct SetupView: View {
                     SplitRing(focus: focus, brk: brk).padding(4)
                     VStack(spacing: 0) {
                         Text("\(focus)").font(Aura.mono(26)).foregroundStyle(Aura.ink)
-                        Text("min focus").font(Aura.body(11)).foregroundStyle(Aura.muted)
+                        Text(dragStart == nil ? "min focus" : "\(brk) min break")
+                            .font(Aura.body(11))
+                            .foregroundStyle(dragStart == nil ? Aura.muted : Aura.tint(.brk))
                     }
                 }
                 .frame(width: 108, height: 108)
+                .contentShape(Circle())
+                .gesture(ringDrag)
+                .onHover { inside in
+                    guard inside != ringHover else { return }
+                    ringHover = inside
+                    if inside { NSCursor.openHand.push() } else { NSCursor.pop() }
+                }
+                .onDisappear { if ringHover { NSCursor.pop(); ringHover = false } }
+                .help("Drag sideways for focus, up or down for break")
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("One round: \(focus) minutes focus, \(brk) minutes break")
 
@@ -1524,9 +1598,9 @@ struct SetupView: View {
 
             Card {
                 VStack(spacing: 0) {
-                    StepRow(dot: Aura.tint(.focus), label: "focus", value: $focus, range: 5...180, step: 5, unit: "min")
+                    StepRow(dot: Aura.tint(.focus), label: "focus", value: $focus, range: focusRange, step: 5, unit: "min")
                     RowDivider()
-                    StepRow(dot: Aura.tint(.brk), label: "break", value: $brk, range: 1...60, step: 1, unit: "min")
+                    StepRow(dot: Aura.tint(.brk), label: "break", value: $brk, range: breakRange, step: 1, unit: "min")
                     RowDivider()
                     StepRow(dot: nil, label: "rounds", value: $rounds, range: 1...12, step: 1, unit: "")
                 }
@@ -1579,6 +1653,30 @@ struct SetupView: View {
     private func join() {
         joinError = model.join(joinText)
         if joinError == nil { joinText = "" }
+    }
+
+    // Drag the ring: sideways sets focus (5 min a step), up and down sets
+    // break (1 min a step), so one diagonal drag sets both. Each step ticks
+    // the trackpad.
+    private var ringDrag: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { g in
+                if dragStart == nil {
+                    dragStart = (focus, brk)
+                    NSCursor.closedHand.push()
+                }
+                guard let s = dragStart else { return }
+                let f = min(focusRange.upperBound, max(focusRange.lowerBound, s.focus + Int((g.translation.width / 6).rounded()) * 5))
+                let b = min(breakRange.upperBound, max(breakRange.lowerBound, s.brk - Int((g.translation.height / 5).rounded())))
+                guard f != focus || b != brk else { return }
+                focus = f
+                brk = b
+                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            }
+            .onEnded { _ in
+                dragStart = nil
+                NSCursor.pop()
+            }
     }
 }
 
@@ -1663,6 +1761,24 @@ struct SettingsView: View {
                         row("also during breaks") { toggle($model.ambientInBreaks, "Background sound during breaks") }
                     }
 
+                    section("notifications") {
+                        row("pop-up notifications") { toggle($model.notificationsOn, "Pop-up notifications") }
+                        ForEach(ChimeEvent.allCases) { e in
+                            RowDivider()
+                            row(e.title) {
+                                toggle(Binding(get: { model.alerts.contains(e) }, set: { model.setAlert(e, $0) }),
+                                       "Alert when: \(e.title)")
+                            }
+                        }
+                        Text(model.notificationsOn
+                             ? "Each alert pops up and plays its chime. Turn pop-ups off to keep just the chimes."
+                             : "Pop-ups are off, so the alerts you keep on only play their chimes.")
+                            .font(Aura.body(11)).foregroundStyle(Aura.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12).padding(.vertical, 10)
+                    }
+
                     section("chimes") {
                         ForEach(ChimeEvent.allCases) { e in
                             row(e.title) {
@@ -1731,12 +1847,6 @@ struct SettingsView: View {
                             .font(Aura.body(11)).foregroundStyle(Aura.muted)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, 12).padding(.bottom, 12)
-                    }
-
-                    section("notifications") {
-                        row("notifications") { toggle($model.notificationsOn, "Notifications") }
-                        RowDivider()
-                        row("1 min warning before breaks end") { toggle($model.breakWarningOn, "One minute warning before breaks end") }
                     }
 
                     section("general") {
