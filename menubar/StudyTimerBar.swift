@@ -872,6 +872,14 @@ final class TimerModel: ObservableObject {
         didSet { defaults.set(offerDueDays, forKey: "offerDueDays") }
     }
     var previewOffer: (() -> Void)?    // Settings → show me the offer now
+    /// Night mode starts at this hour (until 6 am): offers only when you're behind. -1 = no night mode.
+    @Published var offerNightStart = UserDefaults.standard.object(forKey: "offerNightStart") as? Int ?? 22 {
+        didSet { defaults.set(offerNightStart, forKey: "offerNightStart") }
+    }
+    /// No offers before this time (epoch seconds; 0 = not paused). For breaks.
+    @Published var offersPausedUntil = UserDefaults.standard.double(forKey: "offersPausedUntil") {
+        didSet { defaults.set(offersPausedUntil, forKey: "offersPausedUntil") }
+    }
 
     var onThemeChange: (() -> Void)?   // also redraws the menu bar
     private var lastPhaseKey: String?
@@ -2286,6 +2294,34 @@ struct SettingsView: View {
                                 ForEach([1, 2, 3, 4, 5, 7], id: \.self) { Text("\($0) \($0 == 1 ? "day" : "days")").tag($0) }
                             }
                             .labelsHidden().pickerStyle(.menu).fixedSize()
+                        }
+                        RowDivider()
+                        row("night starts") {
+                            Picker("", selection: $model.offerNightStart) {
+                                Text("9 pm").tag(21); Text("10 pm").tag(22); Text("11 pm").tag(23)
+                                Text("midnight").tag(0); Text("no night mode").tag(-1)
+                            }
+                            .labelsHidden().pickerStyle(.menu).fixedSize()
+                            .help("After this (until 6 am) it only offers when you're behind on something due in 2 days, once a night")
+                        }
+                        RowDivider()
+                        row("pause offers") {
+                            toggle(Binding(get: { model.offersPausedUntil > Date().timeIntervalSince1970 },
+                                           set: { on in
+                                               model.offersPausedUntil = on
+                                                   ? Calendar.current.startOfDay(for: Date().addingTimeInterval(7 * 86_400)).timeIntervalSince1970
+                                                   : 0
+                                           }), "Pause offers until a date (breaks, travel)")
+                        }
+                        if model.offersPausedUntil > Date().timeIntervalSince1970 {
+                            RowDivider()
+                            row("back on") {
+                                DatePicker("", selection: Binding(
+                                    get: { Date(timeIntervalSince1970: model.offersPausedUntil) },
+                                    set: { model.offersPausedUntil = Calendar.current.startOfDay(for: $0).timeIntervalSince1970 }),
+                                    in: Date()..., displayedComponents: .date)
+                                    .labelsHidden().datePickerStyle(.compact).fixedSize()
+                            }
                         }
                         RowDivider()
                         row("see the offer") {

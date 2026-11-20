@@ -18,7 +18,8 @@ import SwiftUI
 // ----- What the Mac can see right now -----
 
 struct DueItem {
-    let key: String
+    let courseKey: String?          // Today's course key, for logging study time back
+    let deadlineId: String?         // Today's id for this assignment
     let course: String
     let title: String
     let due: Date
@@ -42,6 +43,8 @@ struct OfferSignals: Codable {
     var sessionRunning: Bool
     var hour: Int
     var weekday: Int                // 1 = Sunday
+    var night: Bool = false
+    var pressure: Double? = nil     // hours left on what's due in 2 days ÷ free hours before it
 }
 
 enum StudyCache {
@@ -90,6 +93,49 @@ enum StudyCache {
         return (true, free, next.map { $0.timeIntervalSince(now) / 60 })
     }
 
+    /// Busy blocks as dates (parsed once per cache change).
+    private static var busyCache: (stamp: Date, blocks: [(Date, Date)])?
+    static func busyBlocks() -> [(Date, Date)] {
+        guard let json = load(), let busy = json["busy"] as? [[String: Any]] else { return [] }
+        let stamp = cached?.stamp ?? .distantPast
+        if let b = busyCache, b.stamp == stamp { return b.blocks }
+        let blocks = busy.compactMap { b -> (Date, Date)? in
+            guard let s = date(b["start"] as? String), let e = date(b["end"] as? String) else { return nil }
+            return (s, e)
+        }
+        busyCache = (stamp, blocks)
+        return blocks
+    }
+
+    /// Free, awake hours (9 am to midnight, not in a busy block) between two times.
+    static func freeHours(from start: Date, to end: Date) -> Double {
+        let blocks = busyBlocks()
+        let cal = Calendar.current
+        var t = start, slots = 0
+        while t < end {
+            let h = cal.component(.hour, from: t)
+            if h >= 9 && !blocks.contains(where: { $0.0 <= t && t < $0.1 }) { slots += 1 }
+            t = t.addingTimeInterval(900)
+        }
+        return Double(slots) / 4
+    }
+
+    /// Am I behind? For homework due in the next 2 days, soonest first: hours still
+    /// needed (adding up) ÷ free hours before each is due. Returns the worst ratio
+    /// and the assignments that are tight (ratio 0.6 or more).
+    static func pressure(at now: Date) -> (Double, [DueItem]) {
+        let items = due(at: now, days: 2)
+        var needed = 0.0, worst = 0.0
+        var tight: [DueItem] = []
+        for item in items {
+            needed += item.hoursLeft
+            let ratio = needed / max(0.5, freeHours(from: now, to: item.due))
+            worst = max(worst, ratio)
+            if ratio >= 0.6 { tight.append(item) }
+        }
+        return ((worst * 100).rounded() / 100, tight)
+    }
+
     /// How many days ahead counts as "due soon" (Settings → offer when due within).
     static var dueDays: Int {
         let d = UserDefaults.standard.integer(forKey: "offerDueDays")
@@ -108,7 +154,7 @@ enum StudyCache {
             let logged = (f["logged"] as? Double) ?? 0
             let left = (f["remaining"] as? Double) ?? max(0, hours - logged)
             guard left > 0 else { return nil }
-            return DueItem(key: (f["key"] as? String) ?? (f["id"] as? String) ?? "",
+            return DueItem(courseKey: f["key"] as? String, deadlineId: f["id"] as? String,
                            course: (f["course"] as? String) ?? "",
                            title: (f["title"] as? String) ?? "something",
                            due: due, hoursLeft: left)
@@ -276,6 +322,11 @@ final class OfferEngine {
     private var wasRunning = false
     private var pendingVia: String?
     private var pendingTask: String?
+    private var pendingItem: DueItem?
+    private var currentItem: DueItem?          // the homework this session is for
+    private var focusRound: (start: Double, round: Int, minutes: Int)?   // the focus round being watched
+    private var lastFocusLeft: Double = 0
+    private var lastTodayRetry = Date.distantPast
 
     init(model: TimerModel, anchor: @escaping () -> NSRect?) {
         self.model = model
@@ -302,6 +353,20 @@ final class OfferEngine {
         return f > 0 ? Preset(focus: f, brk: max(1, b), rounds: max(1, r)) : (model.presets.first ?? defaultPresets[0])
     }
 
+    /// Night = from the Settings hour (10 pm by default) until 6 am. -1 = never.
+    func isNight(_ now: Date) -> Bool {
+        let start = model.offerNightStart
+        guard start >= 0 else { return false }
+        let h = Calendar.current.component(.hour, from: now)
+        return start == 0 ? h < 6 : (h >= start || h < 6)
+    }
+
+    static func nextMorning(after now: Date) -> Date {
+        let cal = Calendar.current
+        let six = cal.date(bySettingHour: 6, minute: 0, second: 0, of: now)!
+        return six > now ? six : cal.date(byAdding: .day, value: 1, to: six)!
+    }
+
     func signals(now: Date = Date(), withBrowser: Bool = false) -> OfferSignals {
         let (known, free, freeMin) = StudyCache.calendar(at: now)
         let due = StudyCache.due(at: now)
@@ -319,7 +384,8 @@ final class OfferEngine {
             dueHoursLeft: due.first?.hoursLeft, dueCount7d: due.count,
             minutesSinceSession: lastSessionEnd.map { (now.timeIntervalSince($0) / 6).rounded() / 10 },
             sessionRunning: sessionRunning,
-            hour: cal.component(.hour, from: now), weekday: cal.component(.weekday, from: now))
+            hour: cal.component(.hour, from: now), weekday: cal.component(.weekday, from: now),
+            night: isNight(now), pressure: StudyCache.pressure(at: now).0)
     }
 
     private func check() {
@@ -332,6 +398,7 @@ final class OfferEngine {
         let running = sessionRunning
         if wasRunning && !running { lastSessionEnd = now }
         wasRunning = running
+        watchFocus(now: now)
 
         // One snapshot a minute while you're at the laptop: the training data.
         if idle < 120 && now.timeIntervalSince(lastSnapshot) >= 60 {
@@ -344,7 +411,7 @@ final class OfferEngine {
             else if now.timeIntervalSince(shown) > Self.offerShownFor {
                 if !isPreview {
                     LockinLog.write("ignored", signals(now: now))
-                    quietUntil = now.addingTimeInterval(Self.quietAfterNo)
+                    quietUntil = isNight(now) ? Self.nextMorning(after: now) : now.addingTimeInterval(Self.quietAfterNo)
                 }
                 hide()
             }
@@ -352,12 +419,88 @@ final class OfferEngine {
         }
 
         guard model.offersOn, !running, now >= quietUntil else { return }
+        guard now.timeIntervalSince1970 >= model.offersPausedUntil else { return }   // paused (e.g. winter break)
         if let end = lastSessionEnd, now.timeIntervalSince(end) < Self.quietAfterSession { return }
         guard let since = activeSince, now.timeIntervalSince(since) >= Self.activeNeeded else { return }
         let (_, free, freeMin) = StudyCache.calendar(at: now)
+        guard free else { return }
+
+        if isNight(now) {
+            // Late: you're usually relaxing, so only speak up when you're behind,
+            // and only once a night.
+            let (worst, tight) = StudyCache.pressure(at: now)
+            guard worst >= 0.6, !tight.isEmpty else { return }
+            quietUntil = Self.nextMorning(after: now)
+            show(items: tight, freeMinutes: freeMin, now: now, preview: false, night: true)
+            return
+        }
         let items = StudyCache.due(at: now)
-        guard free, !items.isEmpty else { return }
+        guard !items.isEmpty else { return }
         show(items: items, freeMinutes: freeMin, now: now, preview: false)
+    }
+
+    // ----- study time back to Today -----
+
+    /// When a focus round for a picked assignment ends, log its minutes in Today,
+    /// so "hours left" goes down (and night mode knows how behind you really are).
+    private func watchFocus(now: Date) {
+        retryToday(now: now)
+        let s = model.session, p = model.phase
+        if let s, let p, p.state == .focus, !model.isPaused {
+            if let f = focusRound, f.start == s.startUtc, f.round == p.round {
+                lastFocusLeft = p.remaining
+            } else {
+                focusRound = (s.startUtc, p.round, s.focus)
+                lastFocusLeft = p.remaining
+            }
+            return
+        }
+        guard let f = focusRound else { return }
+        // The round we were watching is over: finished (break/done) or cut short.
+        let planned = Double(f.minutes)
+        let finished = s?.startUtc == f.start && (p?.state == .brk || p?.state == .finished)
+        let minutes = finished ? planned : max(0, planned - lastFocusLeft / 60)
+        if model.isPaused, s?.startUtc == f.start { return }   // paused mid-round: keep watching
+        focusRound = nil
+        if let item = currentItem, minutes >= 5 { sendToToday(minutes: Int(minutes.rounded()), item: item) }
+        if s == nil || p?.state == .finished { currentItem = nil }
+    }
+
+    private func sendToToday(minutes: Int, item: DueItem) {
+        var row: [String: Any] = ["minutes": minutes, "kind": "study", "note": "lock in",
+                                  "at": ISO8601DateFormatter().string(from: Date())]
+        if let k = item.courseKey { row["courseKey"] = k }
+        if let d = item.deadlineId { row["deadlineId"] = d }
+        var pending = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
+        pending.append(row)
+        UserDefaults.standard.set(pending, forKey: "todayPending")
+        LockinLog.write("logged", via: "today", task: "\(item.course) · \(item.title) · \(minutes) min", signals())
+        retryToday(now: Date(), force: true)
+    }
+
+    /// Today's local server (port 8765) takes the session. If Today isn't open,
+    /// the minutes wait here and go through the next time it is.
+    private func retryToday(now: Date, force: Bool = false) {
+        guard force || now.timeIntervalSince(lastTodayRetry) > 60 else { return }
+        lastTodayRetry = now
+        let pending = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
+        guard let row = pending.first,
+              let body = try? JSONSerialization.data(withJSONObject: ["addSession": row]) else { return }
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:8765/ledger")!, timeoutInterval: 3)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    var left = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
+                    if !left.isEmpty { left.removeFirst() }
+                    UserDefaults.standard.set(left, forKey: "todayPending")
+                    if !left.isEmpty { self?.retryToday(now: Date(), force: true) }
+                }
+            }
+        }.resume()
     }
 
     /// Settings → "show me": the real pill with your real homework, ignoring the rules.
@@ -368,7 +511,7 @@ final class OfferEngine {
         var items = StudyCache.due(at: now)
         if items.isEmpty { items = StudyCache.due(at: now, days: 30) }
         if items.isEmpty {
-            items = [DueItem(key: "example", course: "Example", title: "Nothing unfinished is due soon", due: now.addingTimeInterval(86_400), hoursLeft: 1)]
+            items = [DueItem(courseKey: nil, deadlineId: nil, course: "Example", title: "Nothing unfinished is due soon", due: now.addingTimeInterval(86_400), hoursLeft: 1)]
         }
         show(items: items, freeMinutes: StudyCache.calendar(at: now).2, now: now, preview: true)
     }
@@ -383,7 +526,7 @@ final class OfferEngine {
         return Calendar.current.isDate(until, inSameDayAs: now) ? "free till \(time)" : "free till tomorrow \(time)"
     }
 
-    private func show(items: [DueItem], freeMinutes: Double?, now: Date, preview: Bool) {
+    private func show(items: [DueItem], freeMinutes: Double?, now: Date, preview: Bool, night: Bool = false) {
         let setup = lastSetup
         let picked = Array(items.prefix(Self.maxTasks))
         let tasks = picked.enumerated().map { i, item -> OfferTask in
@@ -392,7 +535,9 @@ final class OfferEngine {
                              title: item.course.isEmpty ? item.title : "\(item.course) · \(item.title)",
                              detail: "due \(Self.dueWords(item.due, now: now)) · \(hours) h left")
         }
-        let header = "\(Self.freeWords(freeMinutes, now: now)) · lock in?"
+        let header = night
+            ? "behind on \(picked.first.map { $0.course.isEmpty ? "homework" : $0.course } ?? "homework") · \(setup.focus) min tonight?"
+            : "\(Self.freeWords(freeMinutes, now: now)) · lock in?"
         let view = OfferView(header: header, tasks: tasks, startLabel: "start \(setup.focus)",
                              onStart: { [weak self] i in self?.accept(index: i, via: "click") },
                              onDismiss: { [weak self] in self?.dismiss() })
@@ -451,13 +596,15 @@ final class OfferEngine {
         let s = lastSetup
         pendingVia = wasPreview ? "preview" : via
         pendingTask = task
+        pendingItem = item
         model.start(focus: s.focus, brk: s.brk, rounds: s.rounds)
     }
 
     private func dismiss() {
         if !isPreview {
             LockinLog.write("dismiss", signals())
-            quietUntil = Date().addingTimeInterval(Self.quietAfterNo)
+            let now = Date()
+            quietUntil = isNight(now) ? Self.nextMorning(after: now) : now.addingTimeInterval(Self.quietAfterNo)
         }
         hide()
     }
@@ -475,8 +622,10 @@ final class OfferEngine {
     private func didStart(via: String) {
         let how = pendingVia ?? via
         let task = pendingTask
+        currentItem = pendingItem
         pendingVia = nil
         pendingTask = nil
+        pendingItem = nil
         if let s = model.session {
             let d = UserDefaults.standard
             d.set(s.focus, forKey: "offerFocus"); d.set(s.brk, forKey: "offerBreak"); d.set(s.rounds, forKey: "offerRounds")
@@ -513,7 +662,9 @@ enum OfferCheck {
         for d in due.prefix(3) {
             lines.append("  · \(d.course) · \(d.title.prefix(50)) · due \(OfferEngine.dueWords(d.due, now: now)) · \(d.hoursLeft) h left")
         }
-        lines.append("would offer (after ~2 min active): \(free && !due.isEmpty ? "yes" : "no")")
+        let (worst, tight) = StudyCache.pressure(at: now)
+        lines.append(String(format: "behind-ness (due in 2 days): %.2f (night offers at 0.60+), tight: %d", worst, tight.count))
+        lines.append("would offer by day (after ~2 min active): \(free && !due.isEmpty ? "yes" : "no")")
         lines.append("log: \(LockinLog.url.path)")
         return lines.joined(separator: "\n")
     }
