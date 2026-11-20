@@ -876,6 +876,11 @@ final class TimerModel: ObservableObject {
     @Published var offerNightStart = UserDefaults.standard.object(forKey: "offerNightStart") as? Int ?? 22 {
         didSet { defaults.set(offerNightStart, forKey: "offerNightStart") }
     }
+    /// Off-days: about 1 day in N the offer rests (0 = never), so you keep starting on your own
+    /// and there are clean days to test against. "Would have offered" is still logged.
+    @Published var offerOffDayEvery = UserDefaults.standard.object(forKey: "offerOffDayEvery") as? Int ?? 5 {
+        didSet { defaults.set(offerOffDayEvery, forKey: "offerOffDayEvery") }
+    }
     /// No offers before this time (epoch seconds; 0 = not paused). For breaks.
     @Published var offersPausedUntil = UserDefaults.standard.double(forKey: "offersPausedUntil") {
         didSet { defaults.set(offersPausedUntil, forKey: "offersPausedUntil") }
@@ -2322,6 +2327,20 @@ struct SettingsView: View {
                                     in: Date()..., displayedComponents: .date)
                                     .labelsHidden().datePickerStyle(.compact).fixedSize()
                             }
+                        }
+                        RowDivider()
+                        row(OffDays.isOff(Date(), every: model.offerOffDayEvery) ? "off-days (today is one)" : "off-days") {
+                            Picker("", selection: $model.offerOffDayEvery) {
+                                Text("1 day in 3").tag(3); Text("1 day in 5").tag(5); Text("1 day in 7").tag(7); Text("never").tag(0)
+                            }
+                            .labelsHidden().pickerStyle(.menu).fixedSize()
+                            .help("Some days the offer rests, so you keep deciding when to start yourself. ⌃⌥L still works.")
+                        }
+                        RowDivider()
+                        row("this week") {
+                            Text(LockinLog.weekLine().replacingOccurrences(of: "this week: ", with: ""))
+                                .font(Aura.body(11)).foregroundStyle(Aura.muted)
+                                .help("Starts from an offer, after an offer you said no to (the reminder), or on your own")
                         }
                         RowDivider()
                         row("see the offer") {

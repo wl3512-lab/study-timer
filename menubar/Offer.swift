@@ -45,6 +45,23 @@ struct OfferSignals: Codable {
     var weekday: Int                // 1 = Sunday
     var night: Bool = false
     var pressure: Double? = nil     // hours left on what's due in 2 days ÷ free hours before it
+    var offDay: Bool? = nil         // a held-out day: offers rest, "would have offered" is still logged
+}
+
+// ----- Off-days: some days the offer rests on purpose -----
+// So you keep deciding for yourself when to start, and so there are clean
+// days to test the rules (or a learned model) against. Rolled once per day.
+enum OffDays {
+    static func isOff(_ date: Date, every: Int) -> Bool {
+        guard every > 0 else { return false }
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        let key = "offDay-" + f.string(from: date)
+        let d = UserDefaults.standard
+        if let v = d.object(forKey: key) as? Bool { return v }
+        let off = Int.random(in: 0..<every) == 0
+        d.set(off, forKey: key)
+        return off
+    }
 }
 
 enum StudyCache {
@@ -200,10 +217,50 @@ enum LockinLog {
 
     struct Entry: Codable {
         let ts: Double
-        let event: String     // snapshot, offer, accept, dismiss, ignored, start
+        let event: String     // snapshot, offer, accept, dismiss, ignored, start, holdout, logged, undo
         let via: String?      // click, hotkey, panel, join, preview
         let task: String?     // which homework you picked from the offer
         let signals: OfferSignals
+    }
+
+    /// Starts in the last 7 days: on your own (panel, join, ⌃⌥L with no offer) vs from an offer.
+    /// Previews don't count. Cached until the log grows.
+    /// Starts in the last 7 days, three kinds:
+    ///   from offers  = picked from the pill (click or ⌃⌥L while it showed)
+    ///   reminded     = started yourself within an hour of an offer you said no to (the pill as a nudge)
+    ///   on your own  = everything else (panel, join, ⌃⌥L with nothing showing)
+    /// Previews don't count. Cached until the log grows.
+    @MainActor private static var weekCache: (size: Int, day: Int, w: Week)?
+    struct Week { var own = 0, offered = 0, reminded = 0 }
+    @MainActor static func week() -> Week {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        let day = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
+        if let c = weekCache, c.size == size, c.day == day { return c.w }
+        struct Row: Decodable { let ts: Double; let event: String; let via: String?; let task: String? }
+        var w = Week()
+        var lastNo: Double = -.infinity
+        let since = Date().addingTimeInterval(-7 * 86_400).timeIntervalSince1970
+        if let text = try? String(contentsOf: url, encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                guard line.contains("\"event\":\"start\"") || line.contains("\"event\":\"dismiss\"")
+                        || line.contains("\"event\":\"ignored\"") else { continue }
+                guard let e = try? JSONDecoder().decode(Row.self, from: Data(line.utf8)), e.ts >= since else { continue }
+                if e.event != "start" { lastNo = e.ts; continue }
+                if e.via == "preview" { continue }
+                if e.task != nil { w.offered += 1 }
+                else if e.ts - lastNo <= 3600 { w.reminded += 1 }
+                else { w.own += 1 }
+            }
+        }
+        weekCache = (size, day, w)
+        return w
+    }
+
+    @MainActor static func weekLine() -> String {
+        let w = week()
+        var parts = ["\(w.offered) from offers", "\(w.reminded) after a reminder", "\(w.own) on your own"]
+        if w.reminded == 0 { parts.remove(at: 1) }
+        return "this week: " + parts.joined(separator: " · ")
     }
 
     static func write(_ event: String, via: String? = nil, task: String? = nil, _ signals: OfferSignals) {
@@ -297,6 +354,44 @@ struct OfferView: View {
     }
 }
 
+// ----- The receipt: what just went to Today, with undo -----
+
+struct ReceiptView: View {
+    let line: String
+    let title: String
+    let week: String
+    let onUndo: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(line).font(Aura.body(13)).foregroundStyle(Color.white)
+                Text(title).font(Aura.body(10.5)).foregroundStyle(Color.white.opacity(0.55))
+                    .lineLimit(1).truncationMode(.tail)
+                Text(week).font(Aura.body(10.5)).foregroundStyle(Color.white.opacity(0.4))
+            }
+            Spacer(minLength: 6)
+            Button(action: onUndo) {
+                Text("undo").font(Aura.body(12)).foregroundStyle(Color.white)
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .background(Capsule().stroke(Color.white.opacity(0.35), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .help("Wrong task or wrong minutes: don't send this to Today")
+            Button(action: onClose) {
+                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.6)).frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14)
+        .frame(width: 380)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(red: 0.07, green: 0.08, blue: 0.16).opacity(0.97)))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 1))
+    }
+}
+
 // ----- Deciding when to offer -----
 
 @MainActor
@@ -306,6 +401,7 @@ final class OfferEngine {
     static let quietAfterSession: Double = 5 * 60  // a short break after a session ends
     static let offerShownFor: Double = 120         // then it slips away on its own
     static let maxTasks = 3
+    static let receiptHold: Double = 90            // seconds to undo before minutes go to Today
 
     private let model: TimerModel
     private let anchor: () -> NSRect?              // the menu bar icon, on screen
@@ -327,6 +423,8 @@ final class OfferEngine {
     private var focusRound: (start: Double, round: Int, minutes: Int)?   // the focus round being watched
     private var lastFocusLeft: Double = 0
     private var lastTodayRetry = Date.distantPast
+    private var receiptPanel: NSPanel?
+    private var receiptId: String?
 
     init(model: TimerModel, anchor: @escaping () -> NSRect?) {
         self.model = model
@@ -385,7 +483,8 @@ final class OfferEngine {
             minutesSinceSession: lastSessionEnd.map { (now.timeIntervalSince($0) / 6).rounded() / 10 },
             sessionRunning: sessionRunning,
             hour: cal.component(.hour, from: now), weekday: cal.component(.weekday, from: now),
-            night: isNight(now), pressure: StudyCache.pressure(at: now).0)
+            night: isNight(now), pressure: StudyCache.pressure(at: now).0,
+            offDay: OffDays.isOff(now, every: model.offerOffDayEvery))
     }
 
     private func check() {
@@ -431,12 +530,23 @@ final class OfferEngine {
             let (worst, tight) = StudyCache.pressure(at: now)
             guard worst >= 0.6, !tight.isEmpty else { return }
             quietUntil = Self.nextMorning(after: now)
+            if holdOut(now) { return }
             show(items: tight, freeMinutes: freeMin, now: now, preview: false, night: true)
             return
         }
         let items = StudyCache.due(at: now)
         guard !items.isEmpty else { return }
+        if holdOut(now) { return }
         show(items: items, freeMinutes: freeMin, now: now, preview: false)
+    }
+
+    /// On an off-day the offer stays hidden, but the moment it would have
+    /// appeared is logged: the held-out test set.
+    private func holdOut(_ now: Date) -> Bool {
+        guard OffDays.isOff(now, every: model.offerOffDayEvery) else { return false }
+        LockinLog.write("holdout", signals(now: now, withBrowser: true))
+        if !isNight(now) { quietUntil = now.addingTimeInterval(Self.quietAfterNo) }
+        return true
     }
 
     // ----- study time back to Today -----
@@ -467,15 +577,55 @@ final class OfferEngine {
     }
 
     private func sendToToday(minutes: Int, item: DueItem) {
+        let id = UUID().uuidString
         var row: [String: Any] = ["minutes": minutes, "kind": "study", "note": "lock in",
                                   "at": ISO8601DateFormatter().string(from: Date())]
+        // Kept back for a moment so a wrong log can be undone before Today sees it.
+        let hold: [String: Any] = ["id": id, "holdUntil": Date().addingTimeInterval(Self.receiptHold).timeIntervalSince1970]
         if let k = item.courseKey { row["courseKey"] = k }
         if let d = item.deadlineId { row["deadlineId"] = d }
         var pending = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
-        pending.append(row)
+        pending.append(["row": row, "hold": hold])
         UserDefaults.standard.set(pending, forKey: "todayPending")
         LockinLog.write("logged", via: "today", task: "\(item.course) · \(item.title) · \(minutes) min", signals())
-        retryToday(now: Date(), force: true)
+        showReceipt(id: id, minutes: minutes, item: item)
+    }
+
+    private func showReceipt(id: String, minutes: Int, item: DueItem) {
+        hideReceipt()
+        let course = item.course.isEmpty ? "Today" : item.course
+        let view = ReceiptView(line: "logged \(minutes) min → \(course)", title: item.title,
+                               week: LockinLog.weekLine(),
+                               onUndo: { [weak self] in self?.undoReceipt() },
+                               onClose: { [weak self] in self?.hideReceipt() })
+        let p = makePanel(NSHostingView(rootView: view))
+        receiptPanel = p
+        receiptId = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.receiptHold) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.receiptId == id else { return }
+                self.hideReceipt()
+                self.retryToday(now: Date(), force: true)
+            }
+        }
+    }
+
+    private func undoReceipt() {
+        guard let id = receiptId else { return }
+        var pending = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
+        let before = pending.count
+        pending.removeAll { (($0["hold"] as? [String: Any])?["id"] as? String) == id }
+        UserDefaults.standard.set(pending, forKey: "todayPending")
+        LockinLog.write("undo", via: pending.count < before ? "kept back" : "too late", signals())
+        hideReceipt()
+    }
+
+    private func hideReceipt() {
+        receiptId = nil
+        guard let p = receiptPanel else { return }
+        receiptPanel = nil
+        NSAnimationContext.runAnimationGroup({ $0.duration = 0.2; p.animator().alphaValue = 0 },
+                                             completionHandler: { p.orderOut(nil) })
     }
 
     /// Today's local server (port 8765) takes the session. If Today isn't open,
@@ -484,8 +634,13 @@ final class OfferEngine {
         guard force || now.timeIntervalSince(lastTodayRetry) > 60 else { return }
         lastTodayRetry = now
         let pending = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
-        guard let row = pending.first,
-              let body = try? JSONSerialization.data(withJSONObject: ["addSession": row]) else { return }
+        // Wrapped rows wait out their undo window; plain rows (older versions) go now.
+        guard let index = pending.firstIndex(where: {
+                  (($0["hold"] as? [String: Any])?["holdUntil"] as? Double ?? 0) <= now.timeIntervalSince1970 }) else { return }
+        let entry = pending[index]
+        let row = entry["row"] as? [String: Any] ?? entry
+        let id = (entry["hold"] as? [String: Any])?["id"] as? String
+        guard let body = try? JSONSerialization.data(withJSONObject: ["addSession": row]) else { return }
         var req = URLRequest(url: URL(string: "http://127.0.0.1:8765/ledger")!, timeoutInterval: 3)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -495,7 +650,11 @@ final class OfferEngine {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     var left = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
-                    if !left.isEmpty { left.removeFirst() }
+                    if let id {
+                        left.removeAll { (($0["hold"] as? [String: Any])?["id"] as? String) == id }
+                    } else if let i = left.firstIndex(where: { $0["hold"] == nil && NSDictionary(dictionary: $0).isEqual(to: row) }) {
+                        left.remove(at: i)
+                    }
                     UserDefaults.standard.set(left, forKey: "todayPending")
                     if !left.isEmpty { self?.retryToday(now: Date(), force: true) }
                 }
@@ -541,7 +700,17 @@ final class OfferEngine {
         let view = OfferView(header: header, tasks: tasks, startLabel: "start \(setup.focus)",
                              onStart: { [weak self] i in self?.accept(index: i, via: "click") },
                              onDismiss: { [weak self] in self?.dismiss() })
-        let host = NSHostingView(rootView: view)
+        let p = makePanel(NSHostingView(rootView: view))
+
+        panel = p
+        shownAt = now
+        shownItems = picked
+        isPreview = preview
+        LockinLog.write(preview ? "preview" : "offer", signals(now: now, withBrowser: true))
+    }
+
+    /// A floating, non-activating pill just under the menu bar icon.
+    private func makePanel(_ host: NSView) -> NSPanel {
         let size = host.fittingSize
         host.frame.size = size
 
@@ -570,11 +739,7 @@ final class OfferEngine {
         p.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { $0.duration = 0.25; p.animator().alphaValue = 1 }
 
-        panel = p
-        shownAt = now
-        shownItems = picked
-        isPreview = preview
-        LockinLog.write(preview ? "preview" : "offer", signals(now: now, withBrowser: true))
+        return p
     }
 
     private func hide() {
@@ -648,7 +813,7 @@ final class OfferEngine {
 
 /// `StudyTimerBar --offer-check`: what the offer sees right now, without showing anything.
 enum OfferCheck {
-    static func report() -> String {
+    @MainActor static func report() -> String {
         let now = Date()
         let (known, free, freeMin) = StudyCache.calendar(at: now)
         let due = StudyCache.due(at: now)
@@ -665,6 +830,11 @@ enum OfferCheck {
         let (worst, tight) = StudyCache.pressure(at: now)
         lines.append(String(format: "behind-ness (due in 2 days): %.2f (night offers at 0.60+), tight: %d", worst, tight.count))
         lines.append("would offer by day (after ~2 min active): \(free && !due.isEmpty ? "yes" : "no")")
+        let every = UserDefaults.standard.object(forKey: "offerOffDayEvery") as? Int ?? 5
+        lines.append("off-day today: \(OffDays.isOff(now, every: every) ? "yes (offers rest, would-offers logged as holdout)" : "no") · 1 in \(every)")
+        lines.append(LockinLog.weekLine())
+        let pending = UserDefaults.standard.array(forKey: "todayPending") as? [[String: Any]] ?? []
+        lines.append("waiting to go to Today: \(pending.count)")
         lines.append("log: \(LockinLog.url.path)")
         return lines.joined(separator: "\n")
     }
