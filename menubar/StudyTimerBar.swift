@@ -862,6 +862,11 @@ final class TimerModel: ObservableObject {
         didSet { defaults.set(try? JSONEncoder().encode(presets), forKey: Key.presets) }
     }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    /// The timer offers itself when you're free, active and something is due (Offer.swift).
+    @Published var offersOn = UserDefaults.standard.object(forKey: "offersOn") as? Bool ?? true {
+        didSet { defaults.set(offersOn, forKey: "offersOn") }
+    }
+    var onStart: ((String) -> Void)?   // how a session began: panel, join (the offer adds click/hotkey)
 
     var onThemeChange: (() -> Void)?   // also redraws the menu bar
     private var lastPhaseKey: String?
@@ -929,6 +934,7 @@ final class TimerModel: ObservableObject {
         jamLink = nil
         codeChanged = false
         if spotifyOnStart { Spotify.start(playlist: spotifyPlaylist) }
+        onStart?("panel")
     }
 
     // Accepts a bare code or a whole invite message. Returns an error, or nil when joined.
@@ -944,6 +950,7 @@ final class TimerModel: ObservableObject {
             } else if spotifyOnStart {
                 Spotify.start(playlist: spotifyPlaylist)
             }
+            onStart?("join")
             return nil
         case .fail(let error):
             return error
@@ -2265,6 +2272,10 @@ struct SettingsView: View {
                             toggle(Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }), "Open at login")
                         }
                         RowDivider()
+                        row("offer to lock in") {
+                            toggle($model.offersOn, "Offer to start when you're free and something is due (⌃⌥L starts it)")
+                        }
+                        RowDivider()
                         HStack {
                             Button("open web timer") { NSWorkspace.shared.open(webTimerURL) }
                                 .buttonStyle(.plain).font(Aura.body(13)).foregroundStyle(Aura.ink)
@@ -2621,6 +2632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var panelHeight: CGFloat = 0
     let model = TimerModel()
     let notificationDelegate = NotificationDelegate()
+    var offers: OfferEngine?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Only one copy at a time: if Study Timer is already running, quit this one.
@@ -2688,6 +2700,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         model.tick()
         updateButton()
+
+        offers = OfferEngine(model: model, anchor: { [weak self] in self?.item.button?.window?.frame })
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -2820,6 +2834,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
 if CommandLine.arguments.contains("--test") {
     exit(runTests() ? 0 : 1)
+}
+if CommandLine.arguments.contains("--offer-check") {
+    print(MainActor.assumeIsolated { OfferCheck.report() })
+    exit(0)
 }
 
 MainActor.assumeIsolated {

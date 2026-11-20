@@ -8,9 +8,12 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Fonts"
 
 # Universal binary (Apple Silicon + Intel) that runs on macOS 13 and later.
+# With more than one file, Swift only runs top-level code from main.swift,
+# so the main file is compiled under that name.
 TMP=$(mktemp -d)
-swiftc -O -swift-version 5 -target arm64-apple-macos13 StudyTimerBar.swift -o "$TMP/arm64"
-swiftc -O -swift-version 5 -target x86_64-apple-macos13 StudyTimerBar.swift -o "$TMP/x86_64"
+cp StudyTimerBar.swift "$TMP/main.swift"
+swiftc -O -swift-version 5 -target arm64-apple-macos13 "$TMP/main.swift" Offer.swift -o "$TMP/arm64"
+swiftc -O -swift-version 5 -target x86_64-apple-macos13 "$TMP/main.swift" Offer.swift -o "$TMP/x86_64"
 lipo -create "$TMP/arm64" "$TMP/x86_64" -output "$APP/Contents/MacOS/StudyTimerBar"
 rm -rf "$TMP"
 
