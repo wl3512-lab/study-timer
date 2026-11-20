@@ -867,6 +867,11 @@ final class TimerModel: ObservableObject {
         didSet { defaults.set(offersOn, forKey: "offersOn") }
     }
     var onStart: ((String) -> Void)?   // how a session began: panel, join (the offer adds click/hotkey)
+    /// "Due soon" for the offer: homework due within this many days.
+    @Published var offerDueDays = UserDefaults.standard.object(forKey: "offerDueDays") as? Int ?? 4 {
+        didSet { defaults.set(offerDueDays, forKey: "offerDueDays") }
+    }
+    var previewOffer: (() -> Void)?    // Settings → show me the offer now
 
     var onThemeChange: (() -> Void)?   // also redraws the menu bar
     private var lastPhaseKey: String?
@@ -2274,6 +2279,18 @@ struct SettingsView: View {
                         RowDivider()
                         row("offer to lock in") {
                             toggle($model.offersOn, "Offer to start when you're free and something is due (⌃⌥L starts it)")
+                        }
+                        RowDivider()
+                        row("when due within") {
+                            Picker("", selection: $model.offerDueDays) {
+                                ForEach([1, 2, 3, 4, 5, 7], id: \.self) { Text("\($0) \($0 == 1 ? "day" : "days")").tag($0) }
+                            }
+                            .labelsHidden().pickerStyle(.menu).fixedSize()
+                        }
+                        RowDivider()
+                        row("see the offer") {
+                            Button("show me") { model.previewOffer?() }
+                                .buttonStyle(.plain).font(Aura.body(13)).foregroundStyle(Aura.ink)
                         }
                         RowDivider()
                         HStack {

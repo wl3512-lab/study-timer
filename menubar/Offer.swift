@@ -3,7 +3,7 @@
 // It offers only when all three are true:
 //   1. your calendar is free right now (busy blocks from the planner's ~/.study-cache.json)
 //   2. you've been active on the laptop for about 2 minutes
-//   3. something is due in the next 7 days (the planner's focus list)
+//   3. homework you haven't finished is due soon (default 4 days; Settings changes it)
 // You start it with one click or one key (⌃⌥L). Nothing starts on its own.
 //
 // Every offer, answer and start is logged on this Mac only, with the signals
@@ -18,6 +18,7 @@ import SwiftUI
 // ----- What the Mac can see right now -----
 
 struct DueItem {
+    let key: String
     let course: String
     let title: String
     let due: Date
@@ -75,32 +76,42 @@ enum StudyCache {
         return nil
     }
 
-    /// (known, free, minutes until the next busy block that starts today)
+    /// (known, free, minutes until the next busy block in the next 24 hours)
     static func calendar(at now: Date) -> (Bool, Bool, Double?) {
         guard let json = load(), let busy = json["busy"] as? [[String: Any]] else { return (false, true, nil) }
         var free = true
         var next: Date?
-        let endOfDay = Calendar.current.startOfDay(for: now).addingTimeInterval(86_400)
+        let horizon = now.addingTimeInterval(86_400)
         for b in busy {
             guard let start = date(b["start"] as? String), let end = date(b["end"] as? String) else { continue }
             if start <= now && now < end { free = false }
-            if start > now && start < endOfDay && (next == nil || start < next!) { next = start }
+            if start > now && start < horizon && (next == nil || start < next!) { next = start }
         }
         return (true, free, next.map { $0.timeIntervalSince(now) / 60 })
     }
 
-    /// Things due in the next 7 days, soonest first.
-    static func due(at now: Date) -> [DueItem] {
+    /// How many days ahead counts as "due soon" (Settings → offer when due within).
+    static var dueDays: Int {
+        let d = UserDefaults.standard.integer(forKey: "offerDueDays")
+        return d > 0 ? d : 4
+    }
+
+    /// Homework you haven't finished that's due soon, soonest first.
+    /// "Not finished" = the planner still has hours left on it.
+    static func due(at now: Date, days: Int = dueDays) -> [DueItem] {
         guard let json = load(), let focus = json["focus"] as? [[String: Any]] else { return [] }
-        let horizon = now.addingTimeInterval(7 * 86_400)
+        let horizon = now.addingTimeInterval(Double(days) * 86_400)
         return focus.compactMap { f -> DueItem? in
             if (f["optional"] as? Bool) == true { return nil }
             guard let due = date(f["due"] as? String), due > now, due < horizon else { return nil }
             let hours = (f["hours"] as? Double) ?? 0
             let logged = (f["logged"] as? Double) ?? 0
-            return DueItem(course: (f["course"] as? String) ?? "",
+            let left = (f["remaining"] as? Double) ?? max(0, hours - logged)
+            guard left > 0 else { return nil }
+            return DueItem(key: (f["key"] as? String) ?? (f["id"] as? String) ?? "",
+                           course: (f["course"] as? String) ?? "",
                            title: (f["title"] as? String) ?? "something",
-                           due: due, hoursLeft: max(0, hours - logged))
+                           due: due, hoursLeft: left)
         }
         .sorted { $0.due < $1.due }
     }
@@ -144,12 +155,13 @@ enum LockinLog {
     struct Entry: Codable {
         let ts: Double
         let event: String     // snapshot, offer, accept, dismiss, ignored, start
-        let via: String?      // click, hotkey, panel, join
+        let via: String?      // click, hotkey, panel, join, preview
+        let task: String?     // which homework you picked from the offer
         let signals: OfferSignals
     }
 
-    static func write(_ event: String, via: String? = nil, _ signals: OfferSignals) {
-        let entry = Entry(ts: Date().timeIntervalSince1970.rounded(), event: event, via: via, signals: signals)
+    static func write(_ event: String, via: String? = nil, task: String? = nil, _ signals: OfferSignals) {
+        let entry = Entry(ts: Date().timeIntervalSince1970.rounded(), event: event, via: via, task: task, signals: signals)
         guard var line = try? JSONEncoder().encode(entry) else { return }
         line.append(0x0A)
         if let handle = try? FileHandle(forWritingTo: url) {
@@ -183,41 +195,58 @@ final class HotKey {
 
 // ----- The offer pill -----
 
+struct OfferTask: Identifiable {
+    let id: Int
+    let title: String
+    let detail: String
+}
+
 struct OfferView: View {
-    let line1: String
-    let line2: String
+    let header: String
+    let tasks: [OfferTask]
     let startLabel: String
-    let onStart: () -> Void
+    let onStart: (Int) -> Void
     let onDismiss: () -> Void
 
+    private let blue = Color(red: 0.62, green: 0.83, blue: 1.0)
+
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(line1).font(Aura.body(13)).foregroundStyle(Color.white)
-                Text(line2).font(Aura.body(11)).foregroundStyle(Color.white.opacity(0.65))
-                    .lineLimit(1).truncationMode(.tail)
-            }
-            Spacer(minLength: 4)
-            Button(action: onStart) {
-                VStack(spacing: 1) {
-                    Text(startLabel).font(Aura.body(13)).foregroundStyle(Color.black)
-                    Text("⌃⌥L").font(.system(size: 9, weight: .medium)).foregroundStyle(Color.black.opacity(0.55))
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center) {
+                Text(header).font(Aura.body(14)).foregroundStyle(Color.white)
+                Spacer(minLength: 8)
+                Text("⌃⌥L = first").font(.system(size: 10, weight: .medium)).foregroundStyle(Color.white.opacity(0.45))
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.6)).frame(width: 22, height: 22)
                 }
-                .padding(.horizontal, 14).padding(.vertical, 6)
-                .background(Capsule().fill(Color(red: 0.62, green: 0.83, blue: 1.0)))
+                .buttonStyle(.plain)
+                .help("Not now (quiet for 30 minutes)")
             }
-            .buttonStyle(.plain)
-            Button(action: onDismiss) {
-                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.6))
-                    .frame(width: 22, height: 22)
+            ForEach(tasks) { t in
+                Button { onStart(t.id) } label: {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(t.title).font(Aura.body(12)).foregroundStyle(Color.white)
+                                .lineLimit(1).truncationMode(.tail)
+                            Text(t.detail).font(Aura.body(10.5)).foregroundStyle(Color.white.opacity(0.55))
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 6)
+                        Text(startLabel).font(Aura.body(12)).foregroundStyle(Color.black)
+                            .padding(.horizontal, 12).padding(.vertical, 5)
+                            .background(Capsule().fill(blue))
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(t.id == 0 ? 0.10 : 0.05)))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
-            .help("Not now (quiet for 30 minutes)")
         }
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .frame(width: 360)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color(red: 0.07, green: 0.08, blue: 0.16).opacity(0.96)))
+        .padding(14)
+        .frame(width: 380)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(red: 0.07, green: 0.08, blue: 0.16).opacity(0.97)))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 1))
     }
 }
@@ -230,6 +259,7 @@ final class OfferEngine {
     static let quietAfterNo: Double = 30 * 60      // after "not now" or no answer
     static let quietAfterSession: Double = 5 * 60  // a short break after a session ends
     static let offerShownFor: Double = 120         // then it slips away on its own
+    static let maxTasks = 3
 
     private let model: TimerModel
     private let anchor: () -> NSRect?              // the menu bar icon, on screen
@@ -237,12 +267,15 @@ final class OfferEngine {
     private var timer: Timer?
     private var panel: NSPanel?
     private var shownAt: Date?
+    private var shownItems: [DueItem] = []
+    private var isPreview = false
     private var quietUntil = Date.distantPast
     private var activeSince: Date?
     private var lastSnapshot = Date.distantPast
     private var lastSessionEnd: Date?
     private var wasRunning = false
     private var pendingVia: String?
+    private var pendingTask: String?
 
     init(model: TimerModel, anchor: @escaping () -> NSRect?) {
         self.model = model
@@ -250,6 +283,7 @@ final class OfferEngine {
         hotKey = HotKey()
         HotKey.onPress = { [weak self] in self?.hotKeyPressed() }
         model.onStart = { [weak self] via in self?.didStart(via: via) }
+        model.previewOffer = { [weak self] in self?.preview() }
         let t = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.check() }
         }
@@ -308,8 +342,10 @@ final class OfferEngine {
         if let shown = shownAt {
             if running { hide() }
             else if now.timeIntervalSince(shown) > Self.offerShownFor {
-                LockinLog.write("ignored", signals(now: now))
-                quietUntil = now.addingTimeInterval(Self.quietAfterNo)
+                if !isPreview {
+                    LockinLog.write("ignored", signals(now: now))
+                    quietUntil = now.addingTimeInterval(Self.quietAfterNo)
+                }
                 hide()
             }
             return
@@ -319,31 +355,52 @@ final class OfferEngine {
         if let end = lastSessionEnd, now.timeIntervalSince(end) < Self.quietAfterSession { return }
         guard let since = activeSince, now.timeIntervalSince(since) >= Self.activeNeeded else { return }
         let (_, free, freeMin) = StudyCache.calendar(at: now)
-        guard free, let item = StudyCache.due(at: now).first else { return }
-        show(item: item, freeMinutes: freeMin, now: now)
+        let items = StudyCache.due(at: now)
+        guard free, !items.isEmpty else { return }
+        show(items: items, freeMinutes: freeMin, now: now, preview: false)
+    }
+
+    /// Settings → "show me": the real pill with your real homework, ignoring the rules.
+    /// Logged as a preview, so it never counts as training data.
+    func preview() {
+        if shownAt != nil { hide() }
+        let now = Date()
+        var items = StudyCache.due(at: now)
+        if items.isEmpty { items = StudyCache.due(at: now, days: 30) }
+        if items.isEmpty {
+            items = [DueItem(key: "example", course: "Example", title: "Nothing unfinished is due soon", due: now.addingTimeInterval(86_400), hoursLeft: 1)]
+        }
+        show(items: items, freeMinutes: StudyCache.calendar(at: now).2, now: now, preview: true)
     }
 
     // ----- showing and answering -----
 
-    private func show(item: DueItem, freeMinutes: Double?, now: Date) {
-        let setup = lastSetup
-        let line1: String
-        if let m = freeMinutes {
-            let f = DateFormatter(); f.dateFormat = "h:mm"
-            line1 = "free till \(f.string(from: now.addingTimeInterval(m * 60))) · lock in?"
-        } else {
-            line1 = "you're free · lock in?"
-        }
-        // Due date first: the title is often long and gets cut off.
-        let line2 = "due \(Self.dueWords(item.due, now: now)) · \(item.course.isEmpty ? "" : item.course + " · ")\(item.title)"
+    nonisolated static func freeWords(_ minutes: Double?, now: Date) -> String {
+        guard let m = minutes else { return "free all day" }
+        let until = now.addingTimeInterval(m * 60)
+        let f = DateFormatter(); f.dateFormat = "h:mm a"
+        let time = f.string(from: until).lowercased()
+        return Calendar.current.isDate(until, inSameDayAs: now) ? "free till \(time)" : "free till tomorrow \(time)"
+    }
 
-        let view = OfferView(line1: line1, line2: line2, startLabel: "start \(setup.focus)",
-                             onStart: { [weak self] in self?.accept(via: "click") },
+    private func show(items: [DueItem], freeMinutes: Double?, now: Date, preview: Bool) {
+        let setup = lastSetup
+        let picked = Array(items.prefix(Self.maxTasks))
+        let tasks = picked.enumerated().map { i, item -> OfferTask in
+            let hours = item.hoursLeft == item.hoursLeft.rounded() ? String(Int(item.hoursLeft)) : String(format: "%.1f", item.hoursLeft)
+            return OfferTask(id: i,
+                             title: item.course.isEmpty ? item.title : "\(item.course) · \(item.title)",
+                             detail: "due \(Self.dueWords(item.due, now: now)) · \(hours) h left")
+        }
+        let header = "\(Self.freeWords(freeMinutes, now: now)) · lock in?"
+        let view = OfferView(header: header, tasks: tasks, startLabel: "start \(setup.focus)",
+                             onStart: { [weak self] i in self?.accept(index: i, via: "click") },
                              onDismiss: { [weak self] in self?.dismiss() })
         let host = NSHostingView(rootView: view)
-        host.frame.size = host.fittingSize
+        let size = host.fittingSize
+        host.frame.size = size
 
-        let p = NSPanel(contentRect: NSRect(origin: .zero, size: host.fittingSize),
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.isFloatingPanel = true
         p.level = .statusBar
@@ -354,7 +411,6 @@ final class OfferEngine {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.contentView = host
 
-        let size = host.fittingSize
         if let icon = anchor() {
             var x = icon.midX - size.width / 2
             if let screen = NSScreen.screens.first(where: { $0.frame.contains(icon.origin) }) ?? NSScreen.main {
@@ -371,36 +427,45 @@ final class OfferEngine {
 
         panel = p
         shownAt = now
-        LockinLog.write("offer", signals(now: now, withBrowser: true))
+        shownItems = picked
+        isPreview = preview
+        LockinLog.write(preview ? "preview" : "offer", signals(now: now, withBrowser: true))
     }
 
     private func hide() {
         guard let p = panel else { return }
         panel = nil
         shownAt = nil
+        shownItems = []
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.2; p.animator().alphaValue = 0 },
                                              completionHandler: { p.orderOut(nil) })
     }
 
-    private func accept(via: String) {
+    private func accept(index: Int, via: String) {
         guard shownAt != nil else { return }
-        LockinLog.write("accept", via: via, signals())
+        let item = index < shownItems.count ? shownItems[index] : nil
+        let task = item.map { "\($0.course) · \($0.title)" }
+        if !isPreview { LockinLog.write("accept", via: via, task: task, signals()) }
+        let wasPreview = isPreview
         hide()
         let s = lastSetup
-        pendingVia = via
+        pendingVia = wasPreview ? "preview" : via
+        pendingTask = task
         model.start(focus: s.focus, brk: s.brk, rounds: s.rounds)
     }
 
     private func dismiss() {
-        LockinLog.write("dismiss", signals())
-        quietUntil = Date().addingTimeInterval(Self.quietAfterNo)
+        if !isPreview {
+            LockinLog.write("dismiss", signals())
+            quietUntil = Date().addingTimeInterval(Self.quietAfterNo)
+        }
         hide()
     }
 
-    /// ⌃⌥L: takes the offer if one is showing, otherwise starts anyway.
+    /// ⌃⌥L: takes the first homework if an offer is showing, otherwise starts anyway.
     /// A start with no offer showing is the model's "you missed one" label.
     private func hotKeyPressed() {
-        if shownAt != nil { accept(via: "hotkey"); return }
+        if shownAt != nil { accept(index: 0, via: "hotkey"); return }
         guard !sessionRunning else { return }
         let s = lastSetup
         pendingVia = "hotkey"
@@ -409,13 +474,15 @@ final class OfferEngine {
 
     private func didStart(via: String) {
         let how = pendingVia ?? via
+        let task = pendingTask
         pendingVia = nil
+        pendingTask = nil
         if let s = model.session {
             let d = UserDefaults.standard
             d.set(s.focus, forKey: "offerFocus"); d.set(s.brk, forKey: "offerBreak"); d.set(s.rounds, forKey: "offerRounds")
         }
         if panel != nil { hide() }
-        LockinLog.write("start", via: how, signals(withBrowser: true))
+        LockinLog.write("start", via: how, task: task, signals(withBrowser: true))
     }
 
     nonisolated static func dueWords(_ due: Date, now: Date) -> String {
@@ -440,7 +507,8 @@ enum OfferCheck {
         var lines = [
             "calendar: \(known ? (free ? "free" : "BUSY") : "no cache (treated as free)")\(freeMin.map { String(format: ", next busy in %.0f min", $0) } ?? ", nothing else today")",
             String(format: "idle: %.0f s", idle),
-            "due in 7 days: \(due.count)",
+            "\(OfferEngine.freeWords(freeMin, now: now))",
+            "unfinished + due within \(StudyCache.dueDays) days: \(due.count)",
         ]
         for d in due.prefix(3) {
             lines.append("  · \(d.course) · \(d.title.prefix(50)) · due \(OfferEngine.dueWords(d.due, now: now)) · \(d.hoursLeft) h left")
