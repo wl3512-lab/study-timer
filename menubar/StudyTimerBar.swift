@@ -881,6 +881,10 @@ final class TimerModel: ObservableObject {
     @Published var offerOffDayEvery = UserDefaults.standard.object(forKey: "offerOffDayEvery") as? Int ?? 5 {
         didSet { defaults.set(offerOffDayEvery, forKey: "offerOffDayEvery") }
     }
+    /// During focus, open the webcam sketch in watch mode to catch "phone down?".
+    @Published var cameraWatch = UserDefaults.standard.object(forKey: "cameraWatch") as? Bool ?? true {
+        didSet { defaults.set(cameraWatch, forKey: "cameraWatch") }
+    }
     /// No offers before this time (epoch seconds; 0 = not paused). For breaks.
     @Published var offersPausedUntil = UserDefaults.standard.double(forKey: "offersPausedUntil") {
         didSet { defaults.set(offersPausedUntil, forKey: "offersPausedUntil") }
@@ -2343,6 +2347,10 @@ struct SettingsView: View {
                                 .help("Starts from an offer, after an offer you said no to (the reminder), or on your own")
                         }
                         RowDivider()
+                        row("watch with camera") {
+                            toggle($model.cameraWatch, "During focus, the webcam sketch opens in a small window and says \"phone down?\" after 20 s on your phone. Camera is off on breaks.")
+                        }
+                        RowDivider()
                         row("see the offer") {
                             Button("show me") { model.previewOffer?() }
                                 .buttonStyle(.plain).font(Aura.body(13)).foregroundStyle(Aura.ink)
@@ -2743,6 +2751,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
         PhoneBridge.shared.onChange = { [weak self] in self?.updateButton() }
+        PhoneBridge.shared.sessionInfo = { [weak self] in
+            guard let m = self?.model, let s = m.session, let p = m.phase else { return ["running": false, "focus": false] }
+            _ = s
+            return ["running": p.state != .finished, "focus": p.state == .focus && !m.isPaused,
+                    "remaining": Int(p.remaining), "watch": m.cameraWatch]
+        }
         PhoneBridge.shared.start()
         if model.notificationsOn { model.requestAuthorization() }
         model.reschedule()
@@ -2752,6 +2766,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             MainActor.assumeIsolated {
                 self?.model.tick()
                 self?.updateButton()
+                if let m = self?.model, m.cameraWatch, m.phase?.state == .focus, !m.isPaused {
+                    PhoneBridge.shared.openWatcherIfNeeded()
+                }
             }
         }
         RunLoop.main.add(timer, forMode: .common)

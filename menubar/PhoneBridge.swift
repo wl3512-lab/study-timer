@@ -4,6 +4,8 @@
 //
 //   POST /phone {"phone": true}   phone up (sent again every few seconds while it lasts)
 //   POST /phone {"phone": false}  phone down
+//   GET  /session                 {"running", "focus", "remaining"}: the sketch's watch
+//                                 mode keeps the camera on only during focus
 //
 // The menu bar ring turns yellow and pulses with "phone down?", and one
 // notification goes out per phone stretch. With no news for 15 s it clears itself.
@@ -19,6 +21,11 @@ final class PhoneBridge {
     private(set) var alertUntil = Date.distantPast
     private var listener: NWListener?
     var onChange: (() -> Void)?
+    /// What the timer is doing, for the sketch's watch mode (GET /session).
+    var sessionInfo: (() -> [String: Any])?
+    private(set) var lastWatcherPing = Date.distantPast
+    /// A watch-mode sketch asked about the session in the last 10 s.
+    var watcherAlive: Bool { Date().timeIntervalSince(lastWatcherPing) < 10 }
 
     var isAlert: Bool { Date() < alertUntil }
 
@@ -58,6 +65,23 @@ final class PhoneBridge {
             UNNotificationRequest(identifier: "phone-down", content: content, trigger: nil))
     }
 
+    /// When a focus round starts and nothing is watching yet, open the sketch
+    /// in watch mode (a small Chrome window). It turns the camera on only during focus.
+    static let watchURL = "https://wl3512-lab.github.io/ml-arts-lock-in-handsfree/sketch/?watch=1"
+    private var lastOpen = Date.distantPast
+    func openWatcherIfNeeded() {
+        guard !watcherAlive, Date().timeIntervalSince(lastOpen) > 60 else { return }
+        lastOpen = Date()
+        if FileManager.default.fileExists(atPath: "/Applications/Google Chrome.app") {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            p.arguments = ["-na", "Google Chrome", "--args", "--app=\(Self.watchURL)", "--window-size=420,520"]
+            try? p.run()
+        } else if let url = URL(string: Self.watchURL) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     // ----- a very small HTTP server -----
 
     nonisolated private static func read(_ conn: NWConnection, buffer: Data) {
@@ -77,7 +101,15 @@ final class PhoneBridge {
 
             let first = head.split(separator: "\r\n").first.map(String.init) ?? ""
             var status = "204 No Content"
-            if first.hasPrefix("POST /phone") {
+            var json: String?
+            if first.hasPrefix("GET /session") {
+                status = "200 OK"
+                let info: [String: Any] = MainActor.assumeIsolated {
+                    PhoneBridge.shared.lastWatcherPing = Date()
+                    return PhoneBridge.shared.sessionInfo?() ?? ["running": false, "focus": false]
+                }
+                json = (try? JSONSerialization.data(withJSONObject: info)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            } else if first.hasPrefix("POST /phone") {
                 let obj = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
                 if let phone = obj?["phone"] as? Bool {
                     DispatchQueue.main.async { MainActor.assumeIsolated { PhoneBridge.shared.set(phone: phone) } }
@@ -87,10 +119,11 @@ final class PhoneBridge {
             }
             let reply = "HTTP/1.1 \(status)\r\n"
                 + "Access-Control-Allow-Origin: *\r\n"
-                + "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
+                + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                 + "Access-Control-Allow-Headers: Content-Type\r\n"
                 + "Access-Control-Allow-Private-Network: true\r\n"
-                + "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                + (json != nil ? "Content-Type: application/json\r\nCache-Control: no-store\r\n" : "")
+                + "Content-Length: \(json?.utf8.count ?? 0)\r\nConnection: close\r\n\r\n" + (json ?? "")
             conn.send(content: Data(reply.utf8), completion: .contentProcessed { _ in conn.cancel() })
         }
     }
