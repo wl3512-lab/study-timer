@@ -12,8 +12,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Fonts"
 # so the main file is compiled under that name.
 TMP=$(mktemp -d)
 cp StudyTimerBar.swift "$TMP/main.swift"
-swiftc -O -swift-version 5 -target arm64-apple-macos13 "$TMP/main.swift" Offer.swift -o "$TMP/arm64"
-swiftc -O -swift-version 5 -target x86_64-apple-macos13 "$TMP/main.swift" Offer.swift -o "$TMP/x86_64"
+swiftc -O -swift-version 5 -target arm64-apple-macos13 "$TMP/main.swift" Offer.swift PhoneBridge.swift -o "$TMP/arm64"
+swiftc -O -swift-version 5 -target x86_64-apple-macos13 "$TMP/main.swift" Offer.swift PhoneBridge.swift -o "$TMP/x86_64"
 lipo -create "$TMP/arm64" "$TMP/x86_64" -output "$APP/Contents/MacOS/StudyTimerBar"
 rm -rf "$TMP"
 

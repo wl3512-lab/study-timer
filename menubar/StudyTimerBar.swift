@@ -2742,6 +2742,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model.pickPicture = { [weak self] kind in self?.choosePicture(for: kind) }
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
+        PhoneBridge.shared.onChange = { [weak self] in self?.updateButton() }
+        PhoneBridge.shared.start()
         if model.notificationsOn { model.requestAuthorization() }
         model.reschedule()
 
@@ -2844,6 +2846,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func updateButton() {
         guard let button = item?.button else { return }
+        // The webcam sketch saw your phone for 20 s: a yellow ring that pulses.
+        if PhoneBridge.shared.isAlert {
+            let on = Int(Date().timeIntervalSince1970 * 2) % 2 == 0
+            let yellow = NSColor(calibratedRed: 1, green: 0.84, blue: 0.35, alpha: on ? 1 : 0.35)
+            var progress = 1.0
+            if let s = model.session, let p = model.phase { progress = phaseProgress(s, p) }
+            button.image = ringIcon(progress: progress, tint: yellow, template: false)
+            button.title = " phone down?"
+            button.toolTip = "Your webcam timer sees your phone"
+            return
+        }
         guard let s = model.session, let p = model.phase else {
             button.image = templateSymbol("circle")
             button.title = ""
