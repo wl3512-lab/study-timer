@@ -82,6 +82,20 @@ final class PhoneBridge {
         }
     }
 
+    static let traceURL: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("StudyTimerBar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("sketch-trace.jsonl")
+    }()
+
+    nonisolated static func appendTrace(_ body: String) {
+        guard !body.isEmpty, var data = body.data(using: .utf8) else { return }
+        if data.last != 0x0A { data.append(0x0A) }
+        if let h = try? FileHandle(forWritingTo: traceURL) { h.seekToEndOfFile(); h.write(data); try? h.close() }
+        else { try? data.write(to: traceURL) }
+    }
+
     // ----- a very small HTTP server -----
 
     nonisolated private static func read(_ conn: NWConnection, buffer: Data) {
@@ -109,6 +123,9 @@ final class PhoneBridge {
                     return PhoneBridge.shared.sessionInfo?() ?? ["running": false, "focus": false]
                 }
                 json = (try? JSONSerialization.data(withJSONObject: info)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            } else if first.hasPrefix("POST /trace") {
+                // the sketch's ?trace=1 test log: one JSON line per reading
+                PhoneBridge.appendTrace(body)
             } else if first.hasPrefix("POST /phone") {
                 let obj = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
                 if let phone = obj?["phone"] as? Bool {
