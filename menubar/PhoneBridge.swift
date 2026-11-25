@@ -75,7 +75,19 @@ final class PhoneBridge {
         if FileManager.default.fileExists(atPath: "/Applications/Google Chrome.app") {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            p.arguments = ["-na", "Google Chrome", "--args", "--app=\(Self.watchURL)", "--window-size=420,520"]
+            // -g: open behind whatever you're working in (no focus steal). Small and
+            // tucked into the bottom-right corner; the page keeps watching off-screen
+            // because its loop runs on a worker timer, not on drawing.
+            let w = 220, h = 260
+            var pos = ""
+            if let s = NSScreen.main {
+                let vf = s.visibleFrame, full = s.frame
+                let x = Int(vf.maxX) - w - 12
+                let y = Int(full.maxY - vf.minY) - h - 12   // Chrome uses top-left origin
+                pos = "--window-position=\(x),\(y)"
+            }
+            p.arguments = ["-g", "-na", "Google Chrome", "--args", "--app=\(Self.watchURL)",
+                           "--window-size=\(w),\(h)"] + (pos.isEmpty ? [] : [pos])
             try? p.run()
         } else if let url = URL(string: Self.watchURL) {
             NSWorkspace.shared.open(url)
@@ -89,6 +101,16 @@ final class PhoneBridge {
         return dir.appendingPathComponent("sketch-trace.jsonl")
     }()
 
+    /// ~/Pictures/lock in training/<label>/  (upload the folder into that Teachable Machine class)
+    nonisolated static func saveFrame(_ body: String, label: String) {
+        guard let comma = body.firstIndex(of: ","),
+              let data = Data(base64Encoded: String(body[body.index(after: comma)...])) else { return }
+        let dir = URL(fileURLWithPath: NSHomeDirectory() + "/Pictures/lock in training/" + label, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        try? data.write(to: dir.appendingPathComponent("\(label) \(f.string(from: Date())).jpg"))
+    }
+
     nonisolated static func appendTrace(_ body: String) {
         guard !body.isEmpty, var data = body.data(using: .utf8) else { return }
         if data.last != 0x0A { data.append(0x0A) }
@@ -99,11 +121,11 @@ final class PhoneBridge {
     // ----- a very small HTTP server -----
 
     nonisolated private static func read(_ conn: NWConnection, buffer: Data) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { data, _, done, error in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 262_144) { data, _, done, error in
             var buf = buffer
             if let data { buf.append(data) }
             guard let text = String(data: buf, encoding: .utf8), let split = text.range(of: "\r\n\r\n") else {
-                if done || error != nil || buf.count > 16_384 { conn.cancel() } else { read(conn, buffer: buf) }
+                if done || error != nil || buf.count > 1_048_576 { conn.cancel() } else { read(conn, buffer: buf) }
                 return
             }
             let head = String(text[..<split.lowerBound])
@@ -123,6 +145,11 @@ final class PhoneBridge {
                     return PhoneBridge.shared.sessionInfo?() ?? ["running": false, "focus": false]
                 }
                 json = (try? JSONSerialization.data(withJSONObject: info)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            } else if first.hasPrefix("POST /frame") {
+                // ?collect=<label>: a webcam photo for Teachable Machine training
+                let label = first.components(separatedBy: "label=").dropFirst().first?
+                    .prefix { $0.isLetter } ?? "working"
+                PhoneBridge.saveFrame(body, label: String(label))
             } else if first.hasPrefix("POST /trace") {
                 // the sketch's ?trace=1 test log: one JSON line per reading
                 PhoneBridge.appendTrace(body)
